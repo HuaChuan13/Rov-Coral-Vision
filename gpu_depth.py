@@ -1,4 +1,5 @@
 """NVIDIA-only fused reconstruction; SGBM/WLS matching remains on CPU."""
+
 import ctypes as C
 from pathlib import Path
 
@@ -7,25 +8,28 @@ import numpy as np
 from stereo import _nearest_support_indices
 
 
-def affine_coefficients(guide_small, disparity, valid, radius=2, eps=.001):
-    image = guide_small.astype(np.float32) / 255.
+def affine_coefficients(guide_small, disparity, valid, radius=2, eps=0.001):
+    image = guide_small.astype(np.float32) / 255.0
     weight = valid.astype(np.float32)
     value = np.where(valid, disparity, 0).astype(np.float32)
-    size = (2*radius+1, 2*radius+1)
+    size = (2 * radius + 1, 2 * radius + 1)
+
     def box(x):
         return cv2.boxFilter(x, -1, size, borderType=cv2.BORDER_REFLECT)
+
     support = np.maximum(box(weight), 1e-6)
-    mean_i = box(image*weight)/support
-    mean_p = box(value)/support
-    variance = np.maximum(0, box(image*image*weight)/support-mean_i*mean_i)
-    covariance = box(image*value)/support-mean_i*mean_p
-    a = covariance/(variance+eps)
-    b = mean_p-a*mean_i
-    a = box(a*weight)/support
-    b = box(b*weight)/support
+    mean_i = box(image * weight) / support
+    mean_p = box(value) / support
+    variance = np.maximum(0, box(image * image * weight) / support - mean_i * mean_i)
+    covariance = box(image * value) / support - mean_i * mean_p
+    a = covariance / (variance + eps)
+    b = mean_p - a * mean_i
+    a = box(a * weight) / support
+    b = box(b * weight) / support
     return np.stack((a, b))
 
-SOURCE = r'''
+
+SOURCE = r"""
 __device__ float bilinear(const float* p, int w, int h, float x, float y) {
     x=fminf(fmaxf(x,0.0f),(float)(w-1));
     y=fminf(fmaxf(y,0.0f),(float)(h-1));
@@ -124,56 +128,71 @@ extern "C" __global__ void reconstruct(
     colors[3*i+1]=palette[3*level+1];
     colors[3*i+2]=palette[3*level+2];
 }
-'''
+"""
+
 
 class FusedGuidedKernel:
     def __init__(self, torch, device):
         self.torch, self.device = torch, device
-        library = next((Path(torch.__file__).parent/'lib').glob('nvrtc64_*.dll'))
+        library = next((Path(torch.__file__).parent / "lib").glob("nvrtc64_*.dll"))
         rtc = C.CDLL(str(library))
         void, pv, char = C.c_void_p, C.POINTER(C.c_void_p), C.c_char_p
         rtc.nvrtcCreateProgram.argtypes = [pv, char, char, C.c_int, C.POINTER(char), C.POINTER(char)]
         rtc.nvrtcCompileProgram.argtypes = [void, C.c_int, C.POINTER(char)]
-        for name in ('nvrtcGetPTXSize', 'nvrtcGetProgramLogSize'):
+        for name in ("nvrtcGetPTXSize", "nvrtcGetProgramLogSize"):
             getattr(rtc, name).argtypes = [void, C.POINTER(C.c_size_t)]
         rtc.nvrtcGetPTX.argtypes = [void, void]
         rtc.nvrtcGetProgramLog.argtypes = [void, void]
         rtc.nvrtcDestroyProgram.argtypes = [pv]
         program = void()
-        self.check(rtc.nvrtcCreateProgram(C.byref(program), SOURCE.encode(), b'guided.cu', 0, None, None))
+        self.check(rtc.nvrtcCreateProgram(C.byref(program), SOURCE.encode(), b"guided.cu", 0, None, None))
         try:
             major, minor = torch.cuda.get_device_capability(device)
-            opts = (char*2)(b'--std=c++11', ('--gpu-architecture=compute_%d%d' % (major, minor)).encode())
+            opts = (char * 2)(b"--std=c++11", ("--gpu-architecture=compute_%d%d" % (major, minor)).encode())
             status = rtc.nvrtcCompileProgram(program, len(opts), opts)
             if status:
                 length = C.c_size_t()
                 rtc.nvrtcGetProgramLogSize(program, C.byref(length))
                 log = C.create_string_buffer(length.value)
                 rtc.nvrtcGetProgramLog(program, log)
-                raise RuntimeError('NVRTC: '+log.value.decode(errors='replace'))
+                raise RuntimeError("NVRTC: " + log.value.decode(errors="replace"))
             length = C.c_size_t()
             self.check(rtc.nvrtcGetPTXSize(program, C.byref(length)))
             ptx = C.create_string_buffer(length.value)
             self.check(rtc.nvrtcGetPTX(program, ptx))
         finally:
             rtc.nvrtcDestroyProgram(C.byref(program))
-        self.driver = C.WinDLL('nvcuda.dll')
+        self.driver = C.WinDLL("nvcuda.dll")
         self.driver.cuModuleLoadData.argtypes = [pv, void]
         self.driver.cuModuleGetFunction.argtypes = [pv, void, char]
-        self.driver.cuLaunchKernel.argtypes = [void]+[C.c_uint]*7+[void, pv, pv]
+        self.driver.cuLaunchKernel.argtypes = [void] + [C.c_uint] * 7 + [void, pv, pv]
         self.module, self.function, self.complete_function = void(), void(), void()
         with torch.cuda.device(device):
             torch.empty(1, device=device)  # establish the primary context
             self.check(self.driver.cuModuleLoadData(C.byref(self.module), ptx))
-            self.check(self.driver.cuModuleGetFunction(C.byref(self.function), self.module, b'reconstruct'))
-            self.check(self.driver.cuModuleGetFunction(C.byref(self.complete_function), self.module, b'complete_low'))
+            self.check(self.driver.cuModuleGetFunction(C.byref(self.function), self.module, b"reconstruct"))
+            self.check(
+                self.driver.cuModuleGetFunction(C.byref(self.complete_function), self.module, b"complete_low")
+            )
 
     @staticmethod
     def check(status):
         if status != 0:
-            raise RuntimeError('CUDA/NVRTC API error %d' % status)
+            raise RuntimeError("CUDA/NVRTC API error %d" % status)
 
-    def __call__(self, coeff, anchors, guide, palette, geometry, near, far, keep_on_gpu=False, complete_display=False, display_inputs=None):
+    def __call__(
+        self,
+        coeff,
+        anchors,
+        guide,
+        palette,
+        geometry,
+        near,
+        far,
+        keep_on_gpu=False,
+        complete_display=False,
+        display_inputs=None,
+    ):
         torch = self.torch
         h, w = guide.shape
         lw, lh = geometry.stereo_size
@@ -183,26 +202,42 @@ class FusedGuidedKernel:
         display_tensors = []
         if complete_display:
             if display_inputs is None:
-                raise ValueError('Display completion requires supported disparities and RGB guides')
+                raise ValueError("Display completion requires supported disparities and RGB guides")
             disparity, seeds, low_rgb, rgb = display_inputs
             display_filled = torch.empty((lh, lw), device=self.device, dtype=torch.float32)
             fill_args = [C.c_void_p(a.data_ptr()) for a in (disparity, seeds, low_rgb, display_filled)]
             fill_args += [C.c_int(lw), C.c_int(lh)]
-            fill_ptrs = (C.c_void_p*len(fill_args))(*(C.cast(C.byref(a), C.c_void_p) for a in fill_args))
-            self.check(self.driver.cuLaunchKernel(self.complete_function, (lw*lh+255)//256, 1, 1,
-                256, 1, 1, 0, stream, fill_ptrs, None))
+            fill_ptrs = (C.c_void_p * len(fill_args))(*(C.cast(C.byref(a), C.c_void_p) for a in fill_args))
+            self.check(
+                self.driver.cuLaunchKernel(
+                    self.complete_function,
+                    (lw * lh + 255) // 256,
+                    1,
+                    1,
+                    256,
+                    1,
+                    1,
+                    0,
+                    stream,
+                    fill_ptrs,
+                    None,
+                )
+            )
             display_tensors = [*display_inputs, display_filled]
             display_pointers = [C.c_void_p(a.data_ptr()) for a in (display_filled, low_rgb, rgb)]
         else:
-            display_pointers = [C.c_void_p(0)]*3
+            display_pointers = [C.c_void_p(0)] * 3
         args = [C.c_void_p(a.data_ptr()) for a in (coeff, anchors, guide, palette, output, colors)]
         args += display_pointers
         args += [C.c_int(v) for v in (w, h, lw, lh)]
-        args += [C.c_float(v) for v in (w/lw, geometry.fB, geometry.cx_delta, near, far)]
+        args += [C.c_float(v) for v in (w / lw, geometry.fB, geometry.cx_delta, near, far)]
         args += [C.c_int(int(complete_display))]
-        pointers = (C.c_void_p*len(args))(*(C.cast(C.byref(a), C.c_void_p) for a in args))
-        self.check(self.driver.cuLaunchKernel(self.function, (w*h+255)//256, 1, 1, 256, 1, 1, 0,
-                                              stream, pointers, None))
+        pointers = (C.c_void_p * len(args))(*(C.cast(C.byref(a), C.c_void_p) for a in args))
+        self.check(
+            self.driver.cuLaunchKernel(
+                self.function, (w * h + 255) // 256, 1, 1, 256, 1, 1, 0, stream, pointers, None
+            )
+        )
         self.display_depth = output[2]
         if keep_on_gpu:
             # Uploads used the same stream; record lifetime for the asynchronous
@@ -214,16 +249,20 @@ class FusedGuidedKernel:
         cpu = output.cpu().numpy()
         return cpu[0], cpu[1], colors.cpu().numpy()
 
+
 class CudaGuidedDepth:
     def __init__(self, device, near, far, keep_on_gpu=False, complete_display=False):
         import torch
+
         self.torch = torch
-        self.device = torch.device('cuda:' + str(device))
+        self.device = torch.device("cuda:" + str(device))
         self.near, self.far = near, far
         self.keep_on_gpu = keep_on_gpu
         self.complete_display = complete_display
         self.display_depth = None
-        palette = cv2.applyColorMap(np.arange(256, dtype=np.uint8).reshape(256, 1), cv2.COLORMAP_TURBO).reshape(256, 3)
+        palette = cv2.applyColorMap(
+            np.arange(256, dtype=np.uint8).reshape(256, 1), cv2.COLORMAP_TURBO
+        ).reshape(256, 3)
         self.palette = torch.from_numpy(palette.copy()).to(self.device)
         self.fused = FusedGuidedKernel(torch, self.device)
 
@@ -234,7 +273,11 @@ class CudaGuidedDepth:
         coefficients = affine_coefficients(low_gray, filtered, valid)
         seeds = None
         if self.complete_display:
-            in_range = valid & (filtered-geometry.cx_delta >= geometry.fB/self.far) & (filtered-geometry.cx_delta <= geometry.fB/self.near)
+            in_range = (
+                valid
+                & (filtered - geometry.cx_delta >= geometry.fB / self.far)
+                & (filtered - geometry.cx_delta <= geometry.fB / self.near)
+            )
             seeds = _nearest_support_indices(filtered, in_range)
         # Nearest support preserves holes and avoids turning filled pixels into
         # measured observations. Raw disparity remains the consistency anchor.
@@ -245,15 +288,24 @@ class CudaGuidedDepth:
                 # Color hypotheses need only center-aligned guidance, not a
                 # second full area reduction. Keep measurement low_gray intact.
                 low_color = cv2.resize(guide, geometry.stereo_size, interpolation=cv2.INTER_LINEAR)
-                display_inputs = tuple(torch.from_numpy(np.ascontiguousarray(a)).to(self.device, non_blocking=True)
-                    for a in (filtered, seeds, low_color, guide))
+                display_inputs = tuple(
+                    torch.from_numpy(np.ascontiguousarray(a)).to(self.device, non_blocking=True)
+                    for a in (filtered, seeds, low_color, guide)
+                )
             # Enqueue uploads on one stream instead of synchronizing after
             # every small tensor. The color download below waits for completion;
             # all NumPy source buffers remain alive until that return.
-            result = self.fused(torch.from_numpy(coefficients).to(self.device, non_blocking=True),
-                              torch.from_numpy(masks).to(self.device, non_blocking=True),
-                              torch.from_numpy(gray).to(self.device, non_blocking=True), self.palette,
-                              geometry, self.near, self.far, self.keep_on_gpu,
-                              seeds is not None, display_inputs=display_inputs)
+            result = self.fused(
+                torch.from_numpy(coefficients).to(self.device, non_blocking=True),
+                torch.from_numpy(masks).to(self.device, non_blocking=True),
+                torch.from_numpy(gray).to(self.device, non_blocking=True),
+                self.palette,
+                geometry,
+                self.near,
+                self.far,
+                self.keep_on_gpu,
+                seeds is not None,
+                display_inputs=display_inputs,
+            )
             self.display_depth = self.fused.display_depth
             return result
