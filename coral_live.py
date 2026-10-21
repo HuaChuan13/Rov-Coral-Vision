@@ -699,7 +699,7 @@ def main(argv=None):
     if geometry.quality_passed is False:
         print('WARNING: the supplied water calibration has quality_passed=false. Check known distances before evaluating range accuracy.', flush=True)
     print('Output:', run, '| Q starts recording; W saves and exits.', flush=True)
-    camera, pool = None, None
+    camera, pool, preview = None, None, None
     recorder = VideoRecorder(run)
     show = args.live or args.show_offline
     rows, timestamps = [], deque(maxlen=60)
@@ -740,10 +740,8 @@ def main(argv=None):
             rgb_projection = ApproximateRgbProjection(projection_meta, geometry)
             save_json(run / 'rgb_projection.json', rgb_projection.metadata())
         if show:
-            view_scale = min(1., 1613/(2*geometry.size[0]+128), 900/(geometry.size[1]+120))
-            window_size = (round((2*geometry.size[0]+128)*view_scale), round((geometry.size[1]+120)*view_scale))
-            cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(WINDOW, *window_size)
+            from preview_window import PreviewWindow
+            preview = PreviewWindow(WINDOW, (2*geometry.size[0]+128, geometry.size[1]+120))
         pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='stereo-cpu')
         limit = args.frames or (0 if args.live else 120)
         with (run / 'frame_metrics.csv').open('w', newline='', encoding='utf-8-sig') as log, \
@@ -833,9 +831,7 @@ def main(argv=None):
                     if projected is not None:
                         np.save(run/'depth_in_rgb_APPROXIMATE_m.npy', projected.depth_map)
                 if show:
-                    # Fit the physical desktop before HighGUI presentation;
-                    # computation, saved arrays and video remain full resolution.
-                    cv2.imshow(WINDOW, cv2.resize(canvas, window_size, interpolation=cv2.INTER_LINEAR))
+                    preview.show(canvas)
                 if args.record_offline and frame_no == 0:
                     recorder.start(canvas, time.perf_counter())
                 elif recorder.active:
@@ -867,8 +863,8 @@ def main(argv=None):
                 ctypes.WinDLL('winmm').timeEndPeriod(1)
             if pool:
                 pool.shutdown(wait=True)
-            if show:
-                cv2.destroyAllWindows()
+            if preview:
+                preview.close()
             stable = rows[10:] if len(rows) > 10 else rows
             mean_ms = float(np.mean([r[6] for r in stable])) if stable else None
             summary = {'processed_frames': frame_no, 'mode': meta['mode'], 'error': error,
