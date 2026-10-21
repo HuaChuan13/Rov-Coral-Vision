@@ -1,10 +1,29 @@
-"""One fused CUDA kernel for guided evaluation/depth/palette, via bundled NVRTC.
-
-No CUDA matching is claimed. Only reconstruction of low-resolution SGBM/WLS
-results is fused. Uses the existing PyTorch CUDA context/stream and allocator.
-"""
+"""NVIDIA-only fused reconstruction; SGBM/WLS matching remains on CPU."""
 import ctypes as C
 from pathlib import Path
+
+import cv2
+import numpy as np
+from stereo import _nearest_support_indices
+
+
+def affine_coefficients(guide_small, disparity, valid, radius=2, eps=.001):
+    image = guide_small.astype(np.float32) / 255.
+    weight = valid.astype(np.float32)
+    value = np.where(valid, disparity, 0).astype(np.float32)
+    size = (2*radius+1, 2*radius+1)
+    def box(x):
+        return cv2.boxFilter(x, -1, size, borderType=cv2.BORDER_REFLECT)
+    support = np.maximum(box(weight), 1e-6)
+    mean_i = box(image*weight)/support
+    mean_p = box(value)/support
+    variance = np.maximum(0, box(image*image*weight)/support-mean_i*mean_i)
+    covariance = box(image*value)/support-mean_i*mean_p
+    a = covariance/(variance+eps)
+    b = mean_p-a*mean_i
+    a = box(a*weight)/support
+    b = box(b*weight)/support
+    return np.stack((a, b))
 
 SOURCE = r'''
 __device__ float bilinear(const float* p, int w, int h, float x, float y) {
@@ -107,7 +126,6 @@ extern "C" __global__ void reconstruct(
 }
 '''
 
-
 class FusedGuidedKernel:
     def __init__(self, torch, device):
         self.torch, self.device = torch, device
@@ -195,3 +213,47 @@ class FusedGuidedKernel:
         # Blocking D2H copy below guarantees allocator lifetime until completion.
         cpu = output.cpu().numpy()
         return cpu[0], cpu[1], colors.cpu().numpy()
+
+class CudaGuidedDepth:
+    def __init__(self, device, near, far, keep_on_gpu=False, complete_display=False):
+        import torch
+        self.torch = torch
+        self.device = torch.device('cuda:' + str(device))
+        self.near, self.far = near, far
+        self.keep_on_gpu = keep_on_gpu
+        self.complete_display = complete_display
+        self.display_depth = None
+        palette = cv2.applyColorMap(np.arange(256, dtype=np.uint8).reshape(256, 1), cv2.COLORMAP_TURBO).reshape(256, 3)
+        self.palette = torch.from_numpy(palette.copy()).to(self.device)
+        self.fused = FusedGuidedKernel(torch, self.device)
+
+    def reconstruct(self, guide, filtered, raw, valid, strict, geometry):
+        torch = self.torch
+        gray = cv2.cvtColor(guide, cv2.COLOR_BGR2GRAY)
+        low_gray = cv2.resize(gray, geometry.stereo_size, interpolation=cv2.INTER_AREA)
+        coefficients = affine_coefficients(low_gray, filtered, valid)
+        seeds = None
+        if self.complete_display:
+            in_range = valid & (filtered-geometry.cx_delta >= geometry.fB/self.far) & (filtered-geometry.cx_delta <= geometry.fB/self.near)
+            seeds = _nearest_support_indices(filtered, in_range)
+        # Nearest support preserves holes and avoids turning filled pixels into
+        # measured observations. Raw disparity remains the consistency anchor.
+        masks = np.stack((valid.astype(np.float32), strict.astype(np.float32), raw))
+        with torch.inference_mode(), torch.cuda.device(self.device):
+            display_inputs = None
+            if seeds is not None:
+                # Color hypotheses need only center-aligned guidance, not a
+                # second full area reduction. Keep measurement low_gray intact.
+                low_color = cv2.resize(guide, geometry.stereo_size, interpolation=cv2.INTER_LINEAR)
+                display_inputs = tuple(torch.from_numpy(np.ascontiguousarray(a)).to(self.device, non_blocking=True)
+                    for a in (filtered, seeds, low_color, guide))
+            # Enqueue uploads on one stream instead of synchronizing after
+            # every small tensor. The color download below waits for completion;
+            # all NumPy source buffers remain alive until that return.
+            result = self.fused(torch.from_numpy(coefficients).to(self.device, non_blocking=True),
+                              torch.from_numpy(masks).to(self.device, non_blocking=True),
+                              torch.from_numpy(gray).to(self.device, non_blocking=True), self.palette,
+                              geometry, self.near, self.far, self.keep_on_gpu,
+                              seeds is not None, display_inputs=display_inputs)
+            self.display_depth = self.fused.display_depth
+            return result

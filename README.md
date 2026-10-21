@@ -69,10 +69,10 @@ Windows VC++ 运行库及 NVIDIA 驱动属于系统组件。
 
 ## 相机、标定与 XYZ
 
-当前启动配置对应 2026-10-13 的 USB 彩色双目水下标定，不是 D435i 的 `640×480` 标定。
+当前版本仅支持这套 USB 左右拼接彩色双目，使用 2026-10-13 的水下标定。RealSense/红外投影与旧棋盘格采样代码已移除。
 
 - 采集：DirectShow / MJPG，目标 30 FPS，实际模式记录在 `camera.json`。
-- 标定：`config/stereo_opencv.yaml`；对应 JSON 为 `config/calibration.json`。
+- 标定：`config/calibration.json`（保留完整质量与采样信息；已核对与原 YAML 几何一致）。
 - 基线：`59.55734255 mm`；不能随意交换左右目。
 - 原始左目：`fx=1406.8097219, fy=1409.6292648, cx=634.4973071, cy=490.6416794`。
 - 原始右目：`fx=1411.7321975, fy=1413.6009901, cx=686.5858993, cy=483.0347250`。
@@ -115,14 +115,13 @@ CUDA 模式默认 native 卷积和 FP16；CPU 模式自动关闭 FP16。
 
 | 文件 | 职责 |
 |---|---|
-| `run.py` | 实时启动入口 |
-| `coral_live.py` | 检测、标定几何、深度、绘图、日志与录像主流程 |
-| `camera.py`、`capture_process.py` | 相机读取与独立进程采集 |
+| `run.py` | 实时/离线统一入口、参数和处理主流程 |
+| `camera.py` | USB 采集进程、原子最新双目帧与实际帧率统计 |
+| `stereo.py` | JSON 标定、SGBM/WLS、XYZ 和 CPU 深度显示 |
+| `gpu_depth.py` | NVIDIA CUDA 重建和内核 |
+| `image_enhancement.py` | 图像增强 |
+| `output.py` | 独立检测记录、画面绘制与录像 |
 | `preview_window.py` | Windows 预览窗口比例约束与等比例显示 |
-| `guided_depth_gpu.py`、`cuda_guided_kernel.py` | CUDA 深度重建 |
-| `cpu_depth_display.py`、`image_enhancement.py` | CPU 深度显示补洞与画面增强 |
-| `capture_quality.py`、`imaging.py` | 采集质量及图像辅助逻辑 |
-| `rgb_depth_projection.py` | RealSense RGB 投影辅助逻辑 |
 | `models/best.pt`、`config/` | 模型和对应标定 |
 | `pyproject.toml`、`uv.lock`、`.python-version` | 项目设置、依赖锁和 Python 版本 |
 | `MANIFEST.sha256` | 当前版本文件校验清单 |
@@ -144,11 +143,14 @@ numpy `1.26.4`、opencv-contrib-python `4.13.0.92`。
 git status
 git log --oneline
 
+# 检查重构前后的标定、深度和 XYZ；需保留 Git 基线历史
+uv run --locked python test_pipeline.py
+
 # 检查四边/四角缩放、最小尺寸、最大化和关闭；不会打开相机
 uv run --locked python test_preview_window.py
 
 # 离线运行已有的原始左右图片，测试计算与编码，不会打开相机
-uv run --locked python coral_live.py --offline "D:\datasets\stereo" --frames 30 --device cpu --record-offline
+uv run --locked python run.py --offline "D:\datasets\stereo" --frames 30 --device cpu --record-offline
 ```
 
 离线目录需包含 `original/*_left.png` 和对应的 `*_right.png`，每张图片为 `1280×720`。
