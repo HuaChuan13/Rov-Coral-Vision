@@ -1,0 +1,8 @@
+.venv/
+.python/
+.uv-cache/
+__pycache__/
+*.pyc
+coral_runs/
+launch_logs/
+.runtime-state.json

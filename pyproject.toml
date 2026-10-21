@@ -1,0 +1,44 @@
+[project]
+name = "underwater-coral-xyz-sbs"
+version = "2026.10.21"
+description = "1280x720-per-eye USB stereo coral detection, enhanced preview and CUDA XYZ"
+requires-python = ">=3.9,<3.10"
+dependencies = [
+    "numpy==1.26.4",
+    "opencv-contrib-python==4.13.0.92",
+    "torch==1.13.1+cu116",
+    "torchvision==0.14.1+cu116",
+    "ultralytics==8.3.199",
+    "ultralytics-thop==2.0.17",
+    "scipy==1.13.1",
+    "matplotlib==3.9.4",
+    "pillow==11.3.0",
+    "pyyaml==6.0.2",
+    "requests==2.32.5",
+    "psutil==7.0.0",
+    "polars==1.33.1",
+    "packaging==25.0",
+    "typing-extensions==4.15.0",
+]
+
+[tool.uv]
+package = false
+required-version = ">=0.9.8"
+environments = ["sys_platform == 'win32' and platform_machine == 'AMD64'"]
+python-preference = "only-managed"
+link-mode = "copy"
+# Preserve the tested NumPy 1.x ABI required by PyTorch 1.13.1. OpenCV's
+# published NumPy>=2 marker is overridden deliberately; validate both the
+# CPU ximgproc and CUDA reconstruction paths were verified before delivery.
+override-dependencies = ["numpy==1.26.4"]
+# contrib already supplies cv2 plus ximgproc. Never install two cv2 providers.
+exclude-dependencies = ["opencv-python"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu116" }
+torchvision = { index = "pytorch-cu116" }
+
+[[tool.uv.index]]
+name = "pytorch-cu116"
+url = "https://download.pytorch.org/whl/cu116"
+explicit = true
