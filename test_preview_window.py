@@ -8,8 +8,8 @@ import numpy as np
 from preview_window import PreviewWindow, constrain_rect
 
 
-def main():
-    size, border, current = (2688, 840), (16, 39), (1280, 400)
+def main(size):
+    border, current = (16, 39), (1280, 400)
     for edge in range(1, 9):
         for width, height in ((1600, 400), (1280, 700), (100, 50)):
             rect = W.RECT(100, 100, 100+width+border[0], 100+height+border[1])
@@ -60,9 +60,10 @@ def main():
     finally:
         window.close()
         window.close()
-    assert image.shape == (840, 2688, 3)
+    assert image.shape == (size[1], size[0], 3)
     print('PASS: all 8 resize handles, minimum size, native events, maximize and close')
 
 
 if __name__ == '__main__':
-    main()
+    for size in ((1280, 880), (2688, 880)):
+        main(size)

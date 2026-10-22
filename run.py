@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 from stereo import WaterGeometry, StereoDepth, observations
 from camera import Camera
-from output import read_image, save_json, host_array, compose_view, detection_records, VideoRecorder
+from output import read_image, save_json, host_array, compose_view, view_size, detection_records, VideoRecorder
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_MODEL = ROOT / "models/best.pt"
@@ -101,6 +101,7 @@ def parse_args(argv=None):
     )
     p.add_argument("--frames", type=int, default=0, help="0: live unlimited, offline 120, capture-only 150")
     p.add_argument("--show-offline", action="store_true")
+    p.add_argument("--show-depth", action="store_true", help="Show the depth debug panel beside the left image")
     p.add_argument("--record-offline", action="store_true", help="Test encoding without camera")
     p.add_argument("--output", type=Path, default=ROOT / "coral_runs")
     p.add_argument(
@@ -326,7 +327,7 @@ def main(argv=None):
         if show:
             from preview_window import PreviewWindow
 
-            preview = PreviewWindow(WINDOW, (2 * geometry.size[0] + 128, geometry.size[1] + 120))
+            preview = PreviewWindow(WINDOW, view_size(geometry, args))
         pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="depth")
         limit = args.frames or (0 if args.live else 120)
         with (
@@ -446,6 +447,7 @@ def main(argv=None):
                     depth=depth if usable else None,
                     depth_fps=frame_rate(depth_stamps),
                     depth_age_ms=depth_age_ms,
+                    detection_age_ms=age_ms,
                 )
                 if frame_no in (0, 29):
                     cv2.imencode(".png", canvas)[1].tofile(str(run / "preview.png"))

@@ -109,8 +109,14 @@ def detection_records(detections, size, confidence=0.6):
     ]
 
 
+def view_size(geometry, args):
+    w, h = geometry.color_size
+    return (2 * w + 128 if args.show_depth else w, h + 160)
+
+
 def compose_view(
-    color, detections, geometry, args, fps, recording, depth=None, depth_fps=0.0, depth_age_ms=None
+    color, detections, geometry, args, fps, recording, depth=None, depth_fps=0.0,
+    depth_age_ms=None, detection_age_ms=None,
 ):
     w, h = geometry.color_size
     if color.shape != (h, w, 3):
@@ -120,84 +126,77 @@ def compose_view(
     stale = depth_age_ms is not None and depth_age_ms > args.depth_max_age * 1000
     if stale:
         depth = None
-    # Pure depth colors only. Completed display pixels NEVER enter measurements.
-    colors = depth["colors"] if depth is not None else np.full_like(color, 25)
-    canvas = np.full((h + 120, 2 * w + 128, 3), 25, np.uint8)
+    width, height = view_size(geometry, args)
+    canvas = np.full((height, width, 3), 25, np.uint8)
     canvas[48 : 48 + h, :w] = view
-    canvas[48 : 48 + h, w : 2 * w] = colors
 
     def fitted(label, xy, max_width, color=(235, 235, 235), scale=0.8):
         pixels = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)[0][0]
         text(canvas, label, xy, color, min(scale, scale * max_width / max(1, pixels)))
 
     accent = (70, 220, 240)
-    prefix = "DETECTION" if args.live else "OFFLINE DETECTION"
-    fitted("%s  %.1f FPS" % (prefix, fps), (16, 32), w - 32)
-    state = "STALE" if stale else "WAIT" if depth is None else "sample age %.0f ms" % depth_age_ms
-    fitted(
-        "DEPTH  %.1f FPS | %s" % (depth_fps if depth is not None else 0.0, state),
-        (w + 16, 32), w - 32,
-    )
-    text(
-        canvas,
-        "REC" if recording else "REC OFF",
-        (canvas.shape[1] - 120, 32),
-        (30, 30, 255) if recording else (150, 150, 150),
-        0.7,
-    )
-    legend_x = 2 * w + 12
-    text(canvas, "Z (cm)", (legend_x, 82), scale=0.65)
-    bar_height = h - 130
-    gradient = np.rint(np.linspace(255, 10, bar_height)).astype(np.uint8).reshape(-1, 1)
-    bar = cv2.applyColorMap(np.repeat(gradient, 28, axis=1), cv2.COLORMAP_TURBO)
-    canvas[132 : 132 + bar_height, legend_x : legend_x + 28] = bar
-    for fraction in np.linspace(0, 1, 6):
-        z = 1 / (1 / args.near - fraction * (1 / args.near - 1 / args.far))
-        yy = 132 + int(fraction * (bar_height - 1))
-        text(canvas, "%.0f" % (100 * z), (legend_x + 36, yy + 7), scale=0.65)
-    canvas[h + 33 : h + 57, legend_x : legend_x + 28] = cv2.applyColorMap(
-        np.zeros((24, 28), np.uint8), cv2.COLORMAP_TURBO
-    )
-    text(canvas, "N/A", (legend_x + 36, h + 53), scale=0.65)
-    # D labels are local to this depth snapshot, NOT persistent tracking IDs.
+    age = "--" if detection_age_ms is None else "%.0f" % detection_age_ms
+    prefix = "LEFT" if args.live else "OFFLINE LEFT"
+    fitted("%s | %.1f FPS | frame age %s ms" % (prefix, fps, age), (16, 32), w - 160)
+    text(canvas, "REC" if recording else "REC OFF", (width - 120, 32),
+         (30, 30, 255) if recording else (150, 150, 150), 0.7)
+
+    if args.show_depth:
+        # Display completion never supplies numeric XYZ measurements.
+        canvas[48 : 48 + h, w : 2 * w] = depth["colors"] if depth is not None else 25
+        fitted("DEPTH DEBUG | %.1f FPS" % (depth_fps if depth is not None else 0),
+               (w + 16, 32), w - 32)
+        legend_x, bar_height = 2 * w + 12, h - 130
+        text(canvas, "Z (cm)", (legend_x, 82), scale=0.65)
+        gradient = np.rint(np.linspace(255, 10, bar_height)).astype(np.uint8).reshape(-1, 1)
+        canvas[132 : 132 + bar_height, legend_x : legend_x + 28] = cv2.applyColorMap(
+            np.repeat(gradient, 28, axis=1), cv2.COLORMAP_TURBO)
+        for fraction in np.linspace(0, 1, 6):
+            z = 1 / (1 / args.near - fraction * (1 / args.near - 1 / args.far))
+            yy = 132 + int(fraction * (bar_height - 1))
+            text(canvas, "%.0f" % (100 * z), (legend_x + 36, yy + 7), scale=0.65)
+        canvas[h + 33 : h + 57, legend_x : legend_x + 28] = cv2.applyColorMap(
+            np.zeros((24, 28), np.uint8), cv2.COLORMAP_TURBO)
+        text(canvas, "N/A", (legend_x + 36, h + 53), scale=0.65)
+
+    # ponytail: no cross-frame target identity yet; keep XYZ in a labelled snapshot list.
     objects = depth["objects"] if depth is not None else []
+    state = "STALE" if stale else "WAIT" if depth is None else "frame %s | age %.0f ms" % (
+        depth["seq"], depth_age_ms)
+    fitted("DEPTH SNAPSHOT | %s | historical measurements, not current boxes" % state,
+           (16, h + 70), width - 32, (170, 170, 170), 0.6)
     for index, record in enumerate(objects[:2]):
         x1, y1, x2, y2 = np.rint(record["box_rectified_xyxy"]).astype(int)
         x1, x2 = np.clip([x1, x2], 0, w - 1)
         y1, y2 = np.clip([y1, y2], 0, h - 1)
-        cv2.rectangle(canvas, (w + x1, 48 + y1), (w + x2, 48 + y2), accent, 2, cv2.LINE_AA)
         tag = "D%d" % (index + 1)
-        tx, ty = w + min(x1 + 6, w - 64), 48 + max(24, y1 - 6)
-        cv2.rectangle(canvas, (tx - 3, ty - 22), (tx + 48, ty + 5), (12, 12, 12), -1)
-        text(canvas, tag, (tx, ty), accent, 0.75)
+        if args.show_depth:
+            cv2.rectangle(canvas, (w + x1, 48 + y1), (w + x2, 48 + y2), accent, 2, cv2.LINE_AA)
+            tx, ty = w + min(x1 + 6, w - 64), 48 + max(24, y1 - 6)
+            cv2.rectangle(canvas, (tx - 3, ty - 22), (tx + 48, ty + 5), (12, 12, 12), -1)
+            text(canvas, tag, (tx, ty), accent, 0.75)
         xyz = record["XYZ_rectified_left_m"]
         values = "X: --    Y: --    Z: --  (no valid depth)"
         if xyz is not None and np.isfinite(xyz).all():
             values = "X: %+.1f    Y: %+.1f    Z: %.1f cm" % tuple(100 * v for v in xyz)
-        fitted(
-            "%s  %s  |  %s" % (tag, record["class"], values),
-            (index * w + 16, h + 80), w - 32, accent, 0.9,
-        )
+        xy = (index * w + 16, h + 96) if args.show_depth else (16, h + 96 + index * 26)
+        fitted("%s  %s  |  %s" % (tag, record["class"], values), xy, w - 32, accent, 0.7)
     if not objects:
         message = (
             "XYZ: -- | Depth expired" if stale else "XYZ: -- | Waiting for depth"
             if depth is None else "XYZ: -- | No target in depth frame"
         )
-        fitted(message, (16, h + 80), 2 * w - 32, accent)
+        fitted(message, (16, h + 96), width - 32, accent, 0.7)
     calibration = (
         "Calibration OK"
         if geometry.verified and getattr(geometry, "quality_passed", None) is not False
         else "Calibration unverified"
     )
-    note = "D1/D2: depth-frame targets | X right, Y down, Z forward"
+    note = "X right / Y down / Z forward"
     if len(objects) > 2:
         note += " | +%d targets in log" % (len(objects) - 2)
-    fitted(
-        "%s | %s | Q: record / W, Esc: exit" % (calibration, note),
-        (16, h + 108),
-        canvas.shape[1] - 30,
-        color=(170, 170, 170), scale=0.6,
-    )
+    fitted("%s | %s | Q record / W, Esc exit" % (calibration, note),
+           (16, h + 148), width - 32, (170, 170, 170), 0.55)
     return canvas
 
 

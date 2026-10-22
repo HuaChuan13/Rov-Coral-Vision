@@ -151,11 +151,12 @@ def check_measurement_view():
 
     args = parse_args([])
     assert args.depth_fps == "max"
+    assert args.imgsz == 416 and args.stereo_width == 320 and not args.show_depth
     assert parse_args(["--depth-fps", "10"]).depth_fps == 10
     assert parse_args(["--depth-fps", "0"]).depth_fps == 0
     geometry = SimpleNamespace(color_size=(1280, 720), verified=False, quality_passed=False)
     color = np.full((720, 1280, 3), 50, np.uint8)
-    depth = dict(colors=color.copy(), objects=[
+    depth = dict(seq=42, colors=color.copy(), objects=[
         dict(box_rectified_xyxy=[200, 150, 400, 450], **{
             "class": "Healthy_Coral", "XYZ_rectified_left_m": [0.123, -0.045, 0.862]}),
         dict(box_rectified_xyxy=[600, 150, 900, 450], **{
@@ -169,21 +170,36 @@ def check_measurement_view():
 
     try:
         output.text = capture
-        fresh = output.compose_view(color, [], geometry, args, 18, False, depth, 12, 80)
-        assert fresh.shape == (840, 2688, 3)
+        fresh = output.compose_view(color, [], geometry, args, 18, False, depth, 12, 80, 35)
+        assert fresh.shape == (880, 1280, 3)
+        assert fresh.shape[1::-1] == output.view_size(geometry, args)
         assert np.array_equal(fresh[48:768, :1280], color), "Historical depth annotated current image"
         assert np.array_equal(depth["colors"], color), "Rendering modified the depth worker's image"
         assert any("D1" in line and "X: +12.3" in line and "Y: -4.5" in line and "Z: 86.2" in line for line in labels)
         assert any("D2" in line and "no valid depth" in line for line in labels)
-        assert any("12.0 FPS" in line and "80 ms" in line for line in labels)
+        assert any("frame 42" in line and "80 ms" in line for line in labels)
+        assert any("18.0 FPS" in line and "35 ms" in line for line in labels)
+        assert not any("DEPTH DEBUG" in line for line in labels)
         labels.clear()
         stale = output.compose_view(color, [], geometry, args, 18, False, depth, 12, 1000)
         assert any("Depth expired" in line for line in labels)
         assert not any("86.2" in line or line == "D1" for line in labels)
-        assert np.all(stale[48:768, 1280:2560] == 25)
+        assert np.array_equal(stale[48:768], color)
         labels.clear()
         output.compose_view(color, [], geometry, args, 18, False)
         assert any("Waiting for depth" in line for line in labels)
+        labels.clear()
+        output.compose_view(color, [], geometry, args, 18, False, dict(depth, objects=[]), 12, 80)
+        assert any("No target" in line for line in labels)
+        args = parse_args(["--show-depth"])
+        debug = output.compose_view(color, [], geometry, args, 18, False, depth, 12, 80)
+        assert debug.shape == (880, 2688, 3)
+        assert debug.shape[1::-1] == output.view_size(geometry, args)
+        assert any("DEPTH DEBUG | 12.0 FPS" in line for line in labels)
+        assert np.array_equal(debug[48:768, :1280], color)
+        assert not np.array_equal(debug[48:768, 1280:2560], color), "Missing depth boxes"
+        stale = output.compose_view(color, [], geometry, args, 18, False, depth, 12, 1000)
+        assert np.all(stale[48:768, 1280:2560] == 25)
     finally:
         output.text = original_text
 
