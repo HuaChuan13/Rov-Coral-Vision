@@ -95,7 +95,7 @@ def check_async(left, right):
                             "--device",
                             "cpu",
                             "--depth-fps",
-                            "5",
+                            "max",
                             "--output",
                             str(root / "out"),
                         ]
@@ -143,6 +143,49 @@ def check_async(left, right):
     finally:
         release.set()
         ultralytics.YOLO, StereoDepth.compute_frame = original_yolo, original_compute
+
+
+def check_measurement_view():
+    """Depth labels must refer to their own frame and disappear when stale."""
+    import output
+
+    args = parse_args([])
+    assert args.depth_fps == "max"
+    assert parse_args(["--depth-fps", "10"]).depth_fps == 10
+    assert parse_args(["--depth-fps", "0"]).depth_fps == 0
+    geometry = SimpleNamespace(color_size=(1280, 720), verified=False, quality_passed=False)
+    color = np.full((720, 1280, 3), 50, np.uint8)
+    depth = dict(colors=color.copy(), objects=[
+        dict(box_rectified_xyxy=[200, 150, 400, 450], **{
+            "class": "Healthy_Coral", "XYZ_rectified_left_m": [0.123, -0.045, 0.862]}),
+        dict(box_rectified_xyxy=[600, 150, 900, 450], **{
+            "class": "Bleached_Coral", "XYZ_rectified_left_m": None}),
+    ])
+    original_text, labels = output.text, []
+
+    def capture(image, label, *args, **kwargs):
+        labels.append(label)
+        return original_text(image, label, *args, **kwargs)
+
+    try:
+        output.text = capture
+        fresh = output.compose_view(color, [], geometry, args, 18, False, depth, 12, 80)
+        assert fresh.shape == (840, 2688, 3)
+        assert np.array_equal(fresh[48:768, :1280], color), "Historical depth annotated current image"
+        assert np.array_equal(depth["colors"], color), "Rendering modified the depth worker's image"
+        assert any("D1" in line and "X: +12.3" in line and "Y: -4.5" in line and "Z: 86.2" in line for line in labels)
+        assert any("D2" in line and "no valid depth" in line for line in labels)
+        assert any("12.0 FPS" in line and "80 ms" in line for line in labels)
+        labels.clear()
+        stale = output.compose_view(color, [], geometry, args, 18, False, depth, 12, 1000)
+        assert any("Depth expired" in line for line in labels)
+        assert not any("86.2" in line or line == "D1" for line in labels)
+        assert np.all(stale[48:768, 1280:2560] == 25)
+        labels.clear()
+        output.compose_view(color, [], geometry, args, 18, False)
+        assert any("Waiting for depth" in line for line in labels)
+    finally:
+        output.text = original_text
 
 
 def main():
@@ -209,6 +252,7 @@ def main():
             else:
                 raise AssertionError("Invalid options accepted: " + str(options))
     check_async(left, right)
+    check_measurement_view()
     print(
         "PASS: original geometry/depth/XYZ, output, input validation, bounded asynchronous depth and frame association"
     )

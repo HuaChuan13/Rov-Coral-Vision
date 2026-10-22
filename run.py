@@ -56,9 +56,9 @@ def parse_args(argv=None):
     )
     p.add_argument(
         "--depth-fps",
-        type=float,
-        default=5.0,
-        help="Depth update limit; 0 waits for depth on every detection frame",
+        type=lambda value: value if value == "max" else float(value),
+        default="max",
+        help="max: uncapped asynchronous depth (default); positive Hz: capped async; 0: same-frame synchronous",
     )
     p.add_argument(
         "--depth-max-age", type=float, default=0.75, help="Hide older depth results after this many seconds"
@@ -116,12 +116,15 @@ def parse_args(argv=None):
         args.wls_sigma,
         args.wls_confidence,
         args.capture_fps,
-        args.depth_fps,
+        0 if args.depth_fps == "max" else args.depth_fps,
         args.depth_max_age,
     )
     if not np.isfinite(numeric).all() or args.exposure is not None and not np.isfinite(args.exposure):
         p.error("Expected finite numeric options.")
-    if args.camera < 0 or args.capture_fps <= 0 or args.depth_fps < 0 or args.depth_max_age <= 0:
+    if (
+        args.camera < 0 or args.capture_fps <= 0
+        or (args.depth_fps != "max" and args.depth_fps < 0) or args.depth_max_age <= 0
+    ):
         p.error("Invalid camera index, capture/depth frequency or depth age limit.")
     if not 0 < args.near < args.far or not 0 < args.confidence <= 1:
         p.error("Invalid distance range/confidence.")
@@ -286,7 +289,7 @@ def main(argv=None):
         device,
         "| depth:",
         args.depth_fps,
-        "Hz (0=synchronous)",
+        "(max=uncapped async; positive=Hz; 0=synchronous)",
         flush=True,
     )
     print("Calibration:", args.calibration, "| baseline %.3f mm" % (1000 * geometry.baseline), flush=True)
@@ -397,7 +400,11 @@ def main(argv=None):
                         stamp=stamp,
                         boxes=None,
                     )
-                    next_depth = time.monotonic() + 1 / args.depth_fps if args.depth_fps else 0.0
+                    next_depth = (
+                        time.monotonic() + 1 / args.depth_fps
+                        if args.depth_fps not in ("max", 0)
+                        else 0.0
+                    )
                 enhance_start = time.perf_counter()
                 detector_input = enhancer.apply(color)
                 enhancement_ms = 1000 * (time.perf_counter() - enhance_start)
@@ -429,22 +436,16 @@ def main(argv=None):
                 records = detection_records(found, geometry.size, args.confidence)
                 age_ms = max(0.0, 1000 * (time.monotonic() - stamp))
                 fps = frame_rate(stamps)
-                label = (
-                    ("f%d age %.0fms" % (depth["seq"], depth_age_ms))
-                    if usable
-                    else ("STALE" if depth else "WAIT")
-                )
                 canvas = compose_view(
                     detector_input,
                     found,
                     geometry,
                     args,
                     fps,
-                    capture_fps,
-                    age_ms,
                     recorder.active,
                     depth=depth if usable else None,
-                    depth_label=label,
+                    depth_fps=frame_rate(depth_stamps),
+                    depth_age_ms=depth_age_ms,
                 )
                 if frame_no in (0, 29):
                     cv2.imencode(".png", canvas)[1].tofile(str(run / "preview.png"))
