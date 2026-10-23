@@ -2,7 +2,7 @@
 
 普通 USB 左右拼接双目相机的实时珊瑚检测、图像增强和水下标定测距程序。使用 uv 管理 Python 和依赖。
 
-后续开发见 [珊瑚 yaw 视觉闭环计划](PLAN.md)：已确认网线传视频、USB 直连 Teensy 的双线部署和方案 A（视觉偏差 → 目标航向变化速度 → Teensy 更新目标 yaw → 原有双环），已实现本地目标锁定、观测输出和转向请求预览；网络接入、Controller 与 Teensy 执行仍待开发。
+后续开发见 [珊瑚 yaw 视觉闭环计划](PLAN.md)：方案 A 为视觉偏差 → 目标航向变化速度 → Teensy 更新目标 yaw → 原有双环。本地相机、Controller 和 Teensy 已接通；工控机网络视频移到本地闭环验收之后适配。
 
 ## 安装与启动
 
@@ -107,8 +107,8 @@ uv run --locked python run.py --camera 0 --device cpu --show-depth
 水平偏差和 `Yaw target slew`（目标航向变化速度，°/s）。右键或 C 取消；关闭程序重启后需要重新选择。
 期望位置与中央死区以三条竖虚线标示。像素偏差采用校正后左目坐标，缩放/留边不改变坐标。
 
-这一步仅输出观测和候选请求，**不会连接串口或驱动 Teensy**。`PREVIEW ONLY - NOT SENT TO TEENSY`
-表示未下发；`UDP SENT (no ACK)` 只表示本机发送成功，不能据此判断 Controller 在线或 Teensy 接受了请求。
+视觉程序通过本机 UDP 向配套 Controller 输出观测，不直接占用串口。仅运行视觉时显示候选预览；Controller 加 `--vision` 后，自稳模式中的新点击会请求启用 yaw 辅助。
+`PREVIEW - TEENSY CONTROL NOT CONFIRMED` 表示没有新鲜执行回执；`UDP SENT (no ACK)` 仅代表观测已发送。收到回执后显示实际状态与 `Teensy accepted slew`，不能把黄色框当作控制已生效。
 首版 yaw 不依赖 XYZ，深度无有效值时仍可计算水平偏差。D1/D2 测距列表暂不与锁定目标做跨帧绑定。
 
 ```text
@@ -162,6 +162,7 @@ UDP 非阻塞、无重试队列；失败在界面标为 UDP ERROR，计数写入
 | `schema` | 固定 `coral.observation.v1` |
 | `session`、`observation_seq` | 每次启动的新会话和发送序号；事件序号递增不代表有新图像 |
 | `capture_seq`、`lock_id` | 源图像编号、人工选择生成的锁定编号 |
+| `selection_monotonic_s` | 人工选择时间，短暂恢复不更新；取消/真丢失后为 null，用于拒绝启动、接管或模式切换之前的旧点击 |
 | `valid`、`status` | 有效标记及 idle/tracking/waiting/lost/ambiguous/stale/cancelled/no_target/stopped |
 | `capture_monotonic_s`、`result_monotonic_s` | PC 收到源帧和生成这条观测的单调时钟时间（秒） |
 | `source_age_ms`、`valid_for_ms` | 发送时的源帧年龄及从源帧时间起算的总有效期 |
@@ -172,8 +173,8 @@ UDP 非阻塞、无重试队列；失败在界面标为 UDP ERROR，计数写入
 | `track_memory` | 仅供显示的框、最后接受检测时间、年龄、保留剩余时间及恢复计数；`display_only=true`，禁止用于控制 |
 | `preview` | 候选 `yaw_target_slew_dps` 及 gain/deadband/limit_dps/sign/smooth_ms，`sent_to_teensy=false` |
 
-Controller 后续接入时必须检查 schema、数值范围、会话、锁定变化、序号和源帧年龄；
-WAITING 即使源图像新鲜也必须按 `valid=false` 停止视觉修正，所有偏差及候选请求均为 null。Controller 计划使用 `smoothed_error_x` 计算请求，避免再次叠加同类平滑；`track_memory` 不能作为有效观测。
+配套 Controller 检查 schema、数值范围、会话、锁定变化、序号和源帧年龄；
+WAITING 即使源图像新鲜也按 `valid=false` 停止视觉修正，所有偏差及候选请求均为 null。Controller 使用 `smoothed_error_x` 计算请求，避免再次叠加同类平滑；`track_memory` 不能作为有效观测。
 接收时剩余有效期按原源帧时间扣减，不能从收包时重新计时，也不能用 observation_seq 代替 capture_seq 判断新帧。
 重复发送或点击同一源帧不能延长其有效期。只有同 PC 单调时钟可直接比较；时间戳不代表曝光或视频端到端延迟。
 `preview` 用于观察与日志，不能作为不经仲裁直接发给执行器的指令。离线日志和实时日志由 settings.json 的 mode 区分。
@@ -199,6 +200,39 @@ uv run --locked python test_vision.py
 
 置信度参数用0到1的小数，例如50%写作 `0.5`，不能写 `50`。只设置 `--confidence 0.3` 时，续跟门限自动降至0.3；显式设置的续跟门限若高于初选门限会报错。不传参数时保持原来的0.60/0.35。
 降低门限可能减少弱检测导致的漏检、加快等待后的恢复，但不保证身份更稳定：误检和多个候选造成的歧义也可能增加。可先用0.50与默认0.60对照；若问题是框跳动、遮挡或类别变化，单调门限无法解决。检测置信度与双目匹配的 `--wls-confidence` 无关，深度有效性检查保持不变。
+
+## 本地视觉 yaw 辅助
+
+使用三个项目 `codex/local-visual-yaw` 分支的配套版本，Teensy 需烧录该分支固件。两个终端分别启动：
+
+```powershell
+# Controller 目录：COM3 为本次实测端口，按实际枚举修改；--vofa 可选
+uv run python ds5_teensy_demo.py --mode serial --teensy-port COM3 --vision --vofa
+
+# 本视觉项目目录
+uv run --locked python run.py --camera 0 --device cpu --confidence 0.5
+```
+
+Controller 仍读取 DS5，默认50Hz发包。按 R1 进入自稳、释放旋转键后，再点击珊瑚。只有新鲜遥测确认已经自稳时的新点击才允许启用；提前锁定后切模式、重启或重连均须重新点击。右键/C取消，方框或圆圈键立即接管 yaw；松开不自动恢复。前后、横移和升降仍由驾驶员操作。短暂 WAITING 停止修正并保持航向，期限内确认同一目标可恢复；真正丢失须重新点击。
+
+`CONTROL ACTIVE` 表示固件已接受修正，`CENTERED` 表示居中保持，`WAITING` 表示暂停修正，`MANUAL_OVERRIDE/CLICK_AGAIN/WAIT_LINK` 表示接管、需重新选择或无新鲜回执。确认值可能稍晚于当前检测，不等同于艇体已经转到位。XYZ 不参与 yaw。
+
+实际控制参数由 Controller 的 `--vision-gain 10 --vision-limit 5 --vision-sign -1 --vision-deadband 0.04 --vision-exit-deadband 0.06` 决定；本程序 `--yaw-*` 只改变候选预览。进入/退出居中阈值相对半幅宽度，滞回避免重复收拢航向。固件另有限幅5°/s、目标领先5°及200ms独立时效。Controller预留20ms串口传输预算；真实传输超出预算仍需测量，主机帧龄不是曝光到执行延迟。
+
+观测发往 `127.0.0.1:14560`，Controller 从同一socket回复 `coral.control.v1` 到视觉源端口。回执包含会话/锁定ID、确认状态、请求值、已接受值与截止时间；过期不显示为生效。没有新增线程或历史观测队列。
+
+跨项目软件检查，无需连接相机、Teensy或DS5：
+
+```powershell
+# 在 ROV_Teensy41 目录生成测试用主机程序
+python tests/run_host_checks.py --export-vision-sim ../uv20261021/coral_runs/control_link/firmware_sim.exe
+# 在本视觉项目目录
+uv run --locked python test_control_link.py --firmware-sim coral_runs/control_link/firmware_sim.exe
+```
+
+2026-10-23 已烧录配套固件并完成真实Teensy/IMU无动力检查：启用、等待恢复、居中、取消、手动接管、断帧超时和模式重入均通过。随后真实相机240帧与Controller/USB联调，检测约17.90 FPS、深度9.21 Hz；实际识别目标由测试脚本调用同一选择入口，收到617份有效控制回执，八路PWM全为1500。记录位于本机 `coral_runs/control_link/`。
+
+测试结束保留 **MANUAL、推力上限0**。没有进行推进器带动力转动或水下整定；恢复动力前按原流程检查推力上限与方向。
 
 ## 相机、标定与 XYZ
 
@@ -346,7 +380,7 @@ uv run --locked python run.py --offline "D:\datasets\stereo" --frames 30 --devic
 `--exposure` 可按设备驱动单位指定曝光，默认不改当前曝光设置。不要把更短曝光带来的暗画面当作无代价提速。
 
 `test_pipeline.py` 还会故意阻塞深度任务，检查检测仍能完成、队列不增长、历史 XYZ 不会混入当前检测框。
-尚未新增 AMD GPU 后端或 Teensy 控制接口。目标选择、观测输出与请求预览检查见 `test_vision.py`。
+尚未新增 AMD GPU 后端；Teensy 控制由配套 Controller 独占串口完成。目标选择、观测输出与请求预览检查见 `test_vision.py`。
 
 离线目录需包含 `original/*_left.png` 和对应的 `*_right.png`，每张图片为 `1280×720`。
 需要同时验证预览时追加 `--show-offline`。

@@ -227,11 +227,13 @@ def main():
         t.update(records, 0, 10., 10.01)
         t.select(records, (750, 300), 10., 10.02)
         assert t.packet(10.02)["valid"]
+        assert t.packet(10.02)["selection_monotonic_s"] == 10.02
         t.update([], 1, 10.05, 10.06)
         t.update(records, 2, 10.1, 10.11)
         assert not t.packet(10.11)["valid"]
         t.update(records, 3, 10.15, 10.16)
         assert t.packet(10.16)["valid"]
+        assert t.packet(10.16)["selection_monotonic_s"] == 10.02
     assert not tracking_records([[700, 200, 860, 400, .8, .5]], {0: "Coral"}, (1280, 720), .35)
     t = selected(parse_args(["--track-smooth-ms", "0"]))
     t.update([record(710)], 1, 10.05, 10.08)
@@ -272,8 +274,23 @@ def main():
         out = ObservationOutput(Path(temporary), receiver.getsockname()[1])
         try:
             out.publish(packet)
-            received = json.loads(receiver.recv(8192))
+            data, source = receiver.recvfrom(8192)
+            received = json.loads(data)
             assert received == packet and out.errors == 0
+            feedback = dict(schema="coral.control.v1", session=packet["session"], lock_id=packet["lock_id"],
+                            status="ACTIVE", confirmed=True, requested_slew_dps=-2.1, accepted_slew_dps=-2.1,
+                            result_monotonic_s=20., valid_until_monotonic_s=20.2)
+            receiver.sendto(json.dumps(feedback).encode(), source)
+            assert out.control_status(packet, 20.01)["confirmed"]
+            for bad in (dict(feedback, lock_id=packet["lock_id"] + 1),
+                        dict(feedback, session="b" * 32),
+                        dict(feedback, accepted_slew_dps=float("nan")),
+                        dict(feedback, accepted_slew_dps=10 ** 400)):
+                bad["result_monotonic_s"] = 20.02
+                receiver.sendto(json.dumps(bad).encode(), source)
+                assert out.control_status(packet, 20.03)["result_monotonic_s"] == 20.
+            assert not out.control_status(dict(packet, valid=False, status="cancelled"), 20.04)["confirmed"]
+            assert out.control_status(packet, 20.21) is None
             out.publish(stale)
             received = json.loads(receiver.recv(8192))
             assert not received["valid"] and received["capture_monotonic_s"] == original_stamp
@@ -292,7 +309,7 @@ def main():
         geometry = SimpleNamespace(color_size=(1280, 720), verified=False)
         image = np.zeros((720, 1280, 3), np.uint8)
         compose_view(image, [], geometry, args, 18, False, observation=packet)
-        assert any("Yaw target slew:" in s and "NOT SENT TO TEENSY" in s for s in labels)
+        assert any("Yaw target slew:" in s and "CONTROL NOT CONFIRMED" in s for s in labels)
         labels.clear()
         compose_view(image, [], geometry, args, 18, False, observation=stale)
         assert any("-- (INVALID)" in s for s in labels)

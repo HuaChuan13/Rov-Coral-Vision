@@ -117,6 +117,7 @@ def view_size(geometry, args):
 def compose_view(
     color, detections, geometry, args, fps, recording, depth=None, depth_fps=0.0,
     depth_age_ms=None, detection_age_ms=None, observation=None, observation_output="UDP OFF",
+    control=None,
 ):
     w, h = geometry.color_size
     if color.shape != (h, w, 3):
@@ -154,9 +155,15 @@ def compose_view(
         state += " %.0fms" % memory["age_ms"]
     error = "%+.1f%% half-width" % (100 * observation["smoothed_error_x"]) if valid else "--"
     slew = "%+.2f deg/s" % observation["preview"]["yaw_target_slew_dps"] if valid else "-- (INVALID)"
+    if control:
+        observation_output = "Controller linked"
     fitted("TRACK %s | ID %d | smooth X %s | %s" % (state, lock, error, observation_output),
            (16, h + 72), width - 32, accent, 0.65)
-    fitted("Yaw target slew: %s | PREVIEW ONLY - NOT SENT TO TEENSY" % slew,
+    control_line = "Yaw target slew: %s | PREVIEW - TEENSY CONTROL NOT CONFIRMED" % slew
+    if control:
+        accepted = "%+.2f deg/s" % control["accepted_slew_dps"] if control["confirmed"] else "--"
+        control_line = "CONTROL %s | Teensy accepted slew: %s" % (control["status"], accepted)
+    fitted(control_line,
            (16, h + 98), width - 32, accent, 0.7)
     if observation is not None:
         reference = observation["reference_u"]

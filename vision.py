@@ -58,11 +58,13 @@ class TargetObservation:
         self.lock_id, self.observation_seq = 0, 0
         self.seq, self.stamp = -1, None
         self.target, self.status = None, "idle"
+        self.selection_stamp = None
         self.last_seen, self.smooth_box = None, None
         self.recovery, self.recovery_count = None, 0
 
     def cancel(self, status="cancelled"):
         self.target, self.status = None, status
+        self.selection_stamp = None
         self.last_seen, self.smooth_box = None, None
         self.recovery, self.recovery_count = None, 0
 
@@ -87,6 +89,7 @@ class TargetObservation:
                 and r["box_rectified_xyxy"][1] <= y <= r["box_rectified_xyxy"][3]]
         if len(hits) == 1:
             self.lock_id += 1
+            self.selection_stamp = now
             self.accept(hits[0], stamp, reset=True)
         else:
             self.status = "ambiguous" if hits else "no_target"
@@ -166,6 +169,7 @@ class TargetObservation:
         return dict(
             schema="coral.observation.v1", session=self.session, observation_seq=self.observation_seq,
             capture_seq=self.seq, lock_id=self.lock_id, valid=target is not None, status=self.status,
+            selection_monotonic_s=self.selection_stamp,
             capture_monotonic_s=self.stamp, result_monotonic_s=now,
             source_age_ms=None if self.stamp is None else max(0., 1000 * (now - self.stamp)),
             valid_for_ms=1000 * self.args.vision_max_age, coordinate_frame="rectified_left",
@@ -187,6 +191,48 @@ class ObservationOutput:
         self.log = (folder / "vision_observations.jsonl").open("w", encoding="utf-8")
         self.status = "UDP OFF"
         self.errors = 0
+        self.feedback = None
+
+    def control_status(self, observation, now):
+        if not self.socket or not observation:
+            return None
+        for _ in range(16):
+            try:
+                data, source = self.socket.recvfrom(4097)
+            except OSError:
+                break
+            if source != self.address or len(data) > 4096:
+                continue
+            try:
+                value = json.loads(data)
+                if (value["schema"] != "coral.control.v1" or value["session"] != observation["session"]
+                        or type(value["lock_id"]) is not int or value["lock_id"] != observation["lock_id"]
+                        or type(value["confirmed"]) is not bool
+                        or value["status"] not in ("ACTIVE", "CENTERED", "WAITING", "AWAITING_TEENSY", "WAIT_LINK",
+                            "OBSERVE_ONLY", "CLICK_AGAIN", "MANUAL_OVERRIDE", "EXPIRED", "RESTARTED",
+                            "INVALID_DATA", "UDP_ERROR", "MODE_REJECTED", "NEW_VISION_SESSION")):
+                    continue
+                start, end = value["result_monotonic_s"], value["valid_until_monotonic_s"]
+                if (type(start) not in (int, float) or type(end) not in (int, float)
+                        or not math.isfinite(start) or not math.isfinite(end) or not start <= now < end <= start + .201
+                        or self.feedback and start <= self.feedback["result_monotonic_s"]):
+                    continue
+                for key in ("requested_slew_dps", "accepted_slew_dps"):
+                    v = value[key]
+                    if v is not None and (type(v) not in (int, float) or not math.isfinite(v) or abs(v) > 5):
+                        raise ValueError("invalid slew")
+                if value["confirmed"] and value["accepted_slew_dps"] is None:
+                    continue
+                self.feedback = value
+            except (ValueError, KeyError, TypeError, OverflowError):
+                continue
+        value = self.feedback
+        if not value or now >= value["valid_until_monotonic_s"] or value["lock_id"] != observation["lock_id"]:
+            return None
+        if not observation["valid"]:
+            return dict(value, status="WAITING" if observation["status"] == "waiting" else "CLICK_AGAIN",
+                        confirmed=False, accepted_slew_dps=None)
+        return value
 
     def publish(self, packet):
         payload = json.dumps(packet, ensure_ascii=False, allow_nan=False, separators=(",", ":"))

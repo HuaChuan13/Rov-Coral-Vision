@@ -351,6 +351,7 @@ def main(argv=None):
             depth_age_ms=1000 * (now - depth["stamp"]) if depth else None,
             detection_age_ms=1000 * (now - stamp), observation=observation,
             observation_output=publisher.status,
+            control=publisher.control_status(observation, now),
         )
 
     try:
