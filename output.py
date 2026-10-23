@@ -142,29 +142,51 @@ def compose_view(
         text(canvas, label, xy, color, min(scale, scale * max_width / max(1, pixels)))
 
     accent = (70, 220, 240)
-    age = "--" if detection_age_ms is None else "%.0f" % detection_age_ms
-    prefix = "LEFT" if args.live else "OFFLINE LEFT"
-    fitted("%s | %.1f FPS | frame age %s ms" % (prefix, fps, age), (16, 32), w - 160)
-    text(canvas, "REC" if recording else "REC OFF", (width - 120, 32),
-         (30, 30, 255) if recording else (150, 150, 150), 0.7)
-
-    state = observation["status"].upper() if observation else "IDLE"
-    lock = observation["lock_id"] if observation else 0
     memory = observation.get("track_memory") if observation else None
-    if memory and state == "WAITING":
-        state += " %.0fms" % memory["age_ms"]
-    error = "%+.1f%% half-width" % (100 * observation["smoothed_error_x"]) if valid else "--"
-    slew = "%+.2f deg/s" % observation["preview"]["yaw_target_slew_dps"] if valid else "-- (INVALID)"
-    if control:
-        observation_output = "Controller linked"
-    fitted("TRACK %s | ID %d | smooth X %s | %s" % (state, lock, error, observation_output),
-           (16, h + 72), width - 32, accent, 0.65)
-    control_line = "Yaw target slew: %s | PREVIEW - TEENSY CONTROL NOT CONFIRMED" % slew
-    if control:
-        accepted = "%+.2f deg/s" % control["accepted_slew_dps"] if control["confirmed"] else "--"
-        control_line = "CONTROL %s | Teensy accepted slew: %s" % (control["status"], accepted)
-    fitted(control_line,
-           (16, h + 98), width - 32, accent, 0.7)
+    active = bool(control and control["confirmed"])
+    status = control["status"] if control else "UNCONFIRMED"
+    labels = {
+        "ACTIVE": "TRACKING", "CENTERED": "CENTERED - HOLDING", "WAITING": "TARGET MISSING - HOLDING" if active else "TARGET MISSING - WAITING FOR TEENSY",
+        "AWAITING_TEENSY": "WAITING FOR TEENSY", "WAIT_LINK": "NO FRESH TEENSY FEEDBACK",
+        "OBSERVE_ONLY": "OBSERVE ONLY - ENTER STABILIZE, THEN CLICK", "CLICK_AGAIN": "CLICK TARGET TO ENABLE",
+        "MANUAL_OVERRIDE": "MANUAL OVERRIDE - CLICK TO RESUME", "EXPIRED": "DATA EXPIRED - CLICK TO RESUME",
+        "RESTARTED": "RESTARTED - CLICK TO RESUME", "INVALID_DATA": "INVALID DATA - CLICK TO RESUME",
+        "UDP_ERROR": "LINK ERROR", "MODE_REJECTED": "MODE REJECTED - ENTER STABILIZE",
+        "NEW_VISION_SESSION": "CLICK TARGET TO ENABLE", "CANCELLED": "CANCELLED - CLICK TO ENABLE",
+        "TARGET_LOST": "TARGET LOST - CLICK TO RESUME", "UNCONFIRMED": "SELECTED - CONTROL UNCONFIRMED" if valid else "CLICK TO SELECT",
+    }
+    mode = control.get("mode") if control else None
+    heading = "%s | %s | %.1f FPS" % (mode or "TEENSY --", labels[status], fps)
+    fitted(heading, (16, 32), w - (100 if recording else 32), scale=.7)
+    if recording:
+        text(canvas, "REC", (w - 72, 32), (30, 30, 255), .65)
+
+    selected = depth.get("selection") if depth is not None and valid else None
+    xyz = selected.get("xyz") if selected and selected["lock_id"] == observation["lock_id"] else None
+    values = "X: --    Y: --    Z: --"
+    if xyz is not None and np.isfinite(xyz).all():
+        values = "X: %+.1f cm    Y: %+.1f cm    Z: %.1f cm" % tuple(100 * v for v in xyz)
+        note = "depth %.0f ms" % depth_age_ms
+        if not geometry.verified or getattr(geometry, "quality_passed", None) is False:
+            note += ", calibration unverified"
+    else:
+        note = "select target" if not valid else "depth off" if not args.depth else "depth expired" if stale else "waiting for target depth"
+    fitted(values + "  |  " + note, (16, h + 86), w - 32, accent, .85)
+    sent = control.get("requested_slew_dps") if control else None
+    accepted = control["accepted_slew_dps"] if control else None
+    rate = lambda v: "--" if v is None else "%+.2f deg/s" % v
+    fitted("Heading slew SENT: %s   |   TEENSY: %s" % (rate(sent), rate(accepted)),
+           (16, h + 130), w - 32, accent, .8)
+    yaw_sp = control.get("yaw_target_deg") if control else None
+    yaw = control.get("yaw_actual_deg") if control else None
+    limit = control.get("lead_limit_deg") if control else None
+    angle = lambda v: "--" if v is None else "%+.1f deg" % v
+    lead_note = ""
+    if yaw_sp is not None and yaw is not None and limit is not None:
+        lead = (yaw_sp - yaw + 180) % 360 - 180
+        lead_note = "  |  %s %.0f deg" % ("LEAD LIMIT" if active and abs(lead) >= limit - .05 else "Lead max", limit)
+    fitted("Yaw TARGET: %s   ACTUAL: %s%s" % (angle(yaw_sp), angle(yaw), lead_note),
+           (16, h + 174), w - 32, scale=.75)
     if observation is not None:
         reference = observation["reference_u"]
         half_band = args.yaw_deadband * w / 2
@@ -176,10 +198,10 @@ def compose_view(
             x1, y1, x2, y2 = np.rint(memory["box_xyxy"]).astype(int)
             x1, x2 = np.clip([x1, x2], 0, w - 1)
             y1, y2 = np.clip([y1, y2], 0, h - 1) + 48
-            tint = accent if valid else (0, 165, 255)
+            tint = ((255, 210, 70) if active else accent) if valid else (0, 165, 255)
             if valid:
                 cv2.rectangle(canvas, (x1, y1), (x2, y2), tint, 3)
-                label = "LOCK %d | %s %.1f%%" % (lock, target["class"], 100 * target["confidence"])
+                label = "%s | %s %.0f%%" % ("CONTROL" if active else "SELECTED", target["class"], 100 * target["confidence"])
             else:
                 for x in range(x1, x2, 18):
                     for y in (y1, y2):
@@ -187,7 +209,7 @@ def compose_view(
                 for y in range(y1, y2, 18):
                     for x in (x1, x2):
                         cv2.line(canvas, (x, y), (x, min(y + 9, y2)), tint, 2)
-                label = "WAIT ID %d | last position | resume %d/2" % (lock, memory["recovery_count"])
+                label = "WAITING - last position"
             label_y = max(72, y1 - 8)
             pixels = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, .6, 1)[0][0]
             label_x = max(4, min(x1, w - pixels - 8))
@@ -212,44 +234,6 @@ def compose_view(
             np.zeros((24, 28), np.uint8), cv2.COLORMAP_TURBO)
         text(canvas, "N/A", (legend_x + 36, h + 53), scale=0.65)
 
-    # Depth snapshots are independent of the current selected target.
-    objects = depth["objects"] if depth is not None else []
-    state = "OFF" if not args.depth else "STALE" if stale else "WAIT" if depth is None else "frame %s | age %.0f ms" % (
-        depth["seq"], depth_age_ms)
-    fitted("DEPTH SNAPSHOT | %s | historical measurements, not current boxes" % state,
-           (16, h + 118), width - 32, (170, 170, 170), 0.6)
-    for index, record in enumerate(objects[:2]):
-        x1, y1, x2, y2 = np.rint(record["box_rectified_xyxy"]).astype(int)
-        x1, x2 = np.clip([x1, x2], 0, w - 1)
-        y1, y2 = np.clip([y1, y2], 0, h - 1)
-        tag = "D%d" % (index + 1)
-        if args.show_depth:
-            cv2.rectangle(canvas, (w + x1, 48 + y1), (w + x2, 48 + y2), accent, 2, cv2.LINE_AA)
-            tx, ty = w + min(x1 + 6, w - 64), 48 + max(24, y1 - 6)
-            cv2.rectangle(canvas, (tx - 3, ty - 22), (tx + 48, ty + 5), (12, 12, 12), -1)
-            text(canvas, tag, (tx, ty), accent, 0.75)
-        xyz = record["XYZ_rectified_left_m"]
-        values = "X: --    Y: --    Z: --  (no valid depth)"
-        if xyz is not None and np.isfinite(xyz).all():
-            values = "X: %+.1f    Y: %+.1f    Z: %.1f cm" % tuple(100 * v for v in xyz)
-        xy = (index * w + 16, h + 144) if args.show_depth else (16, h + 144 + index * 26)
-        fitted("%s  %s  |  %s" % (tag, record["class"], values), xy, w - 32, accent, 0.7)
-    if not objects:
-        message = (
-            "XYZ: -- | Depth disabled" if not args.depth else "XYZ: -- | Depth expired" if stale else "XYZ: -- | Waiting for depth"
-            if depth is None else "XYZ: -- | No target in depth frame"
-        )
-        fitted(message, (16, h + 144), width - 32, accent, 0.7)
-    calibration = (
-        "Calibration OK"
-        if geometry.verified and getattr(geometry, "quality_passed", None) is not False
-        else "Calibration unverified"
-    )
-    note = "X right / Y down / Z forward"
-    if len(objects) > 2:
-        note += " | +%d targets in log" % (len(objects) - 2)
-    fitted("%s | %s | Click select / C cancel / Q record / Esc exit" % (calibration, note),
-           (16, h + 196), width - 32, (170, 170, 170), 0.55)
     return canvas
 
 

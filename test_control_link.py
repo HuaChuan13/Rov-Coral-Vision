@@ -48,7 +48,8 @@ def main():
                         output.publish(p)
                     # Buttons only press Circle for one send; no implicit resume on release.
                     buttons = (1 << 1) if tick == 120 else 0
-                    bridge.receive(now, buttons)
+                    with patch("vision_bridge.time.monotonic", return_value=now):
+                        bridge.receive(now, buttons)
                     line = "-"
                     if tick % 4 == 0:
                         sequence += 1

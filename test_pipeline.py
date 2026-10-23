@@ -174,33 +174,47 @@ def check_measurement_view():
     try:
         output.text = capture
         fresh = output.compose_view(color, [], geometry, args, 18, False, depth, 12, 80, 35)
-        assert fresh.shape == (928, 1280, 3)
-        assert fresh.shape[1::-1] == output.view_size(geometry, args)
+        assert fresh.shape == (928, 1280, 3) and fresh.shape[1::-1] == output.view_size(geometry, args)
         assert np.array_equal(fresh[48:768, :1280], color), "Historical depth annotated current image"
-        assert np.array_equal(depth["colors"], color), "Rendering modified the depth worker's image"
-        assert any("D1" in line and "X: +12.3" in line and "Y: -4.5" in line and "Z: 86.2" in line for line in labels)
-        assert any("D2" in line and "no valid depth" in line for line in labels)
-        assert any("frame 42" in line and "80 ms" in line for line in labels)
-        assert any("18.0 FPS" in line and "35 ms" in line for line in labels)
-        assert not any("DEPTH DEBUG" in line for line in labels)
+        assert not any("86.2" in line for line in labels), "Unselected historical target got a distance"
+        from vision import TargetObservation
+        tracker = TargetObservation((1280, 720), args, 797.55)
+        target = dict(class_id=0, confidence=.9, box_rectified_xyxy=[200,150,400,450], **{"class":"Coral"})
+        tracker.update([target], 42, 10., 10.01)
+        tracker.select([target], (300,300), 10., 10.02)
+        observation = tracker.packet(10.03)
+        # Test binding in finish_depth, not just the display's prepared data.
+        from concurrent.futures import Future
+        from run import finish_depth
+        geometry.size=(1280,720)
+        future=Future()
+        future.set_result(dict(geometry=geometry, grid=np.ones((2,2)), colors=color.copy()))
+        from unittest.mock import patch
+        measured=[([200,150,400,450],0,.9,"Coral",np.array([.123,-.045,.862]),100,"ok")]
+        with patch("run.observations", return_value=measured):
+            attached=finish_depth(dict(future=future, boxes=None, seq=42, stamp=10., selection=observation), {0:"Coral"}, args)
+        depth.update(selection=attached["selection"])
+        assert depth["selection"]["lock_id"] == observation["lock_id"]
         labels.clear()
-        stale = output.compose_view(color, [], geometry, args, 18, False, depth, 12, 1000)
-        assert any("Depth expired" in line for line in labels)
-        assert not any("86.2" in line or line == "D1" for line in labels)
-        assert np.array_equal(stale[48:768], color)
+        output.compose_view(color, [], geometry, args, 18, False, depth, 12, 80, observation=observation)
+        assert any("X: +12.3 cm" in line and "Z: 86.2 cm" in line for line in labels)
+        assert any("depth 80 ms" in line for line in labels)
+        assert not any("D1" in line or "SNAPSHOT" in line for line in labels)
         labels.clear()
-        output.compose_view(color, [], geometry, args, 18, False)
-        assert any("Waiting for depth" in line for line in labels)
+        output.compose_view(color, [], geometry, args, 18, False, depth, 12, 1000, observation=observation)
+        assert any("depth expired" in line for line in labels)
+        assert not any("86.2" in line for line in labels)
         labels.clear()
-        output.compose_view(color, [], geometry, args, 18, False, dict(depth, objects=[]), 12, 80)
-        assert any("No target" in line for line in labels)
+        output.compose_view(color, [], geometry, args, 18, False, depth, 12, 80, observation=dict(observation,lock_id=2))
+        assert not any("86.2" in line for line in labels), "Old lock's distance leaked to new selection"
+        labels.clear()
+        output.compose_view(color, [], geometry, args, 18, False, depth, 12, 80, observation=dict(observation,valid=False))
+        assert not any("86.2" in line for line in labels), "Missing target kept a current distance"
         args = parse_args(["--show-depth"])
         debug = output.compose_view(color, [], geometry, args, 18, False, depth, 12, 80)
         assert debug.shape == (928, 2688, 3)
-        assert debug.shape[1::-1] == output.view_size(geometry, args)
         assert any("DEPTH DEBUG | 12.0 FPS" in line for line in labels)
-        assert np.array_equal(debug[48:768, :1280], color)
-        assert not np.array_equal(debug[48:768, 1280:2560], color), "Missing depth boxes"
+        assert np.array_equal(depth["colors"], color), "Rendering modified the worker image"
         stale = output.compose_view(color, [], geometry, args, 18, False, depth, 12, 1000)
         assert np.all(stale[48:768, 1280:2560] == 25)
     finally:

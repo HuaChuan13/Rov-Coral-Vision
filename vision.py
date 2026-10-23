@@ -189,6 +189,7 @@ class ObservationOutput:
             self.socket.setblocking(False)
         self.address = ("127.0.0.1", port)
         self.log = (folder / "vision_observations.jsonl").open("w", encoding="utf-8")
+        self.control_log = (folder / "control_feedback.jsonl").open("w", encoding="utf-8")
         self.status = "UDP OFF"
         self.errors = 0
         self.feedback = None
@@ -210,7 +211,7 @@ class ObservationOutput:
                         or type(value["confirmed"]) is not bool
                         or value["status"] not in ("ACTIVE", "CENTERED", "WAITING", "AWAITING_TEENSY", "WAIT_LINK",
                             "OBSERVE_ONLY", "CLICK_AGAIN", "MANUAL_OVERRIDE", "EXPIRED", "RESTARTED",
-                            "INVALID_DATA", "UDP_ERROR", "MODE_REJECTED", "NEW_VISION_SESSION")):
+                            "INVALID_DATA", "UDP_ERROR", "MODE_REJECTED", "NEW_VISION_SESSION", "CANCELLED", "TARGET_LOST")):
                     continue
                 start, end = value["result_monotonic_s"], value["valid_until_monotonic_s"]
                 if (type(start) not in (int, float) or type(end) not in (int, float)
@@ -223,13 +224,21 @@ class ObservationOutput:
                         raise ValueError("invalid slew")
                 if value["confirmed"] and value["accepted_slew_dps"] is None:
                     continue
+                if value.get("mode") not in (None, "MANUAL", "STABILIZE"):
+                    continue
+                for key in ("yaw_target_deg", "yaw_actual_deg", "lead_limit_deg"):
+                    v = value.get(key)
+                    if v is not None and (type(v) not in (int, float) or not math.isfinite(v)
+                                          or not (-180 if key != "lead_limit_deg" else .1) <= v <= 180):
+                        raise ValueError("invalid yaw feedback")
                 self.feedback = value
+                self.control_log.write(json.dumps(value, allow_nan=False) + "\n")
             except (ValueError, KeyError, TypeError, OverflowError):
                 continue
         value = self.feedback
         if not value or now >= value["valid_until_monotonic_s"] or value["lock_id"] != observation["lock_id"]:
             return None
-        if not observation["valid"]:
+        if not observation["valid"] and value["confirmed"] and value["status"] != "WAITING":
             return dict(value, status="WAITING" if observation["status"] == "waiting" else "CLICK_AGAIN",
                         confirmed=False, accepted_slew_dps=None)
         return value
@@ -249,3 +258,4 @@ class ObservationOutput:
         if self.socket:
             self.socket.close()
         self.log.close()
+        self.control_log.close()

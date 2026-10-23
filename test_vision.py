@@ -84,7 +84,11 @@ def check_pipeline(freeze=True, confidence=.6):
         def close(self):
             pass
 
-    replacements = [(ultralytics, "YOLO", Detector), (run, "Camera", Camera),
+    encode = cv2.imencode
+    def encode_after_stop(*a, **kw):
+        assert published and published[-1]["status"] == "stopped", "PNG encoding blocked live observations"
+        return encode(*a, **kw)
+    replacements = [(ultralytics, "YOLO", Detector), (run, "Camera", Camera), (cv2, "imencode", encode_after_stop),
                     (preview_window, "PreviewWindow", Window), (cv2, "pollKey", lambda: -1),
                     (cv2, "getWindowProperty", lambda *a: 1), (ObservationOutput, "publish", publish)]
     originals = [(obj, key, getattr(obj, key)) for obj, key, _ in replacements]
@@ -309,16 +313,23 @@ def main():
         geometry = SimpleNamespace(color_size=(1280, 720), verified=False)
         image = np.zeros((720, 1280, 3), np.uint8)
         compose_view(image, [], geometry, args, 18, False, observation=packet)
-        assert any("Yaw target slew:" in s and "CONTROL NOT CONFIRMED" in s for s in labels)
+        assert any("CONTROL UNCONFIRMED" in s for s in labels)
+        assert any("SENT: --" in s and "TEENSY: --" in s for s in labels)
         labels.clear()
         compose_view(image, [], geometry, args, 18, False, observation=stale)
-        assert any("-- (INVALID)" in s for s in labels)
+        assert any("SENT: --" in s for s in labels)
         assert not any("smooth X +" in s for s in labels)
         labels.clear()
         rendered = compose_view(image, [], geometry, args, 18, False, observation=waiting)
         assert any("WAITING" in s for s in labels) and any("last position" in s for s in labels)
-        assert any("-- (INVALID)" in s for s in labels)
+        assert any("SENT: --" in s for s in labels)
         assert np.any(np.all(rendered == (0, 165, 255), axis=2)), "Missing orange waiting outline"
+        labels.clear()
+        feedback = dict(status="ACTIVE", confirmed=True, mode="STABILIZE", requested_slew_dps=2.6,
+                        accepted_slew_dps=2.5, yaw_target_deg=-176., yaw_actual_deg=169., lead_limit_deg=15.)
+        compose_view(image, [], geometry, args, 18, False, observation=packet, control=feedback)
+        assert any("SENT: +2.60" in s and "TEENSY: +2.50" in s for s in labels)
+        assert any("LEAD LIMIT 15" in s for s in labels), "Wrapped heading limit missing"
     finally:
         output.text = original
     check_pipeline()

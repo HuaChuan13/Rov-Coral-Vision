@@ -241,6 +241,15 @@ def finish_depth(pending, names, args):
         objects=detection_records(found, result["geometry"].color_size, args.confidence),
         valid_fraction=float(np.isfinite(result["grid"]).mean()),
     )
+    # Attach XYZ to the lock that was valid on this exact source frame, never a later box.
+    selection = pending.get("selection")
+    result["selection"] = None
+    if selection and selection["valid"]:
+        target = selection["target"]
+        matches = [r for r in result["objects"] if r["class_id"] == target["class_id"]
+                   and np.allclose(r["box_rectified_xyxy"], target["box_rectified_xyxy"], atol=1)]
+        if len(matches) == 1:
+            result["selection"] = dict(lock_id=selection["lock_id"], xyz=matches[0]["XYZ_rectified_left_m"])
     return result
 
 
@@ -253,6 +262,7 @@ def log_depth(stream, depth):
                 "result_age_ms": max(0.0, 1000 * (time.monotonic() - depth["stamp"])),
                 "stereo_ms": depth["stereo_ms"],
                 "objects": depth["objects"],
+                "selection": depth.get("selection"),
             },
             ensure_ascii=False,
         )
@@ -337,7 +347,7 @@ def main(argv=None):
     observer = TargetObservation(geometry.color_size, args, geometry.P1[0, 2])
     publisher, observation = None, None
     records, stamp, last_render = [], None, 0.0
-    saved_lock_preview = False
+    snapshots = {}  # Fixed set of diagnostics; encode/save only after control has stopped.
     began = time.perf_counter()
 
     def render_current(now):
@@ -493,6 +503,7 @@ def main(argv=None):
                 publisher.publish(observation)
                 if scheduled:
                     pending["boxes"] = boxes
+                    pending["selection"] = observation
                 if args.depth and args.depth_fps == 0:
                     depth = finish_depth(pending, model.names, args)
                     pending, updated = None, True
@@ -513,22 +524,19 @@ def main(argv=None):
                 last_render = time.monotonic()
                 canvas = render_current(last_render)
                 if frame_no in (0, 29):
-                    cv2.imencode(".png", canvas)[1].tofile(str(run / "preview.png"))
-                if observation["valid"] and not saved_lock_preview:
-                    cv2.imencode(".png", canvas)[1].tofile(str(run / "preview_locked.png"))
-                    saved_lock_preview = True
+                    snapshots["preview.png"] = canvas.copy()
+                if observation["valid"] and "preview_locked.png" not in snapshots:
+                    snapshots["preview_locked.png"] = canvas.copy()
                 if frame_no == 29:
-                    cv2.imencode(".png", color)[1].tofile(str(run / "left_rectified_1280x720.png"))
-                    cv2.imencode(".png", detector_input)[1].tofile(str(run / "detection_input_1280x720.png"))
+                    snapshots["left_rectified_1280x720.png"] = color.copy()
+                    snapshots["detection_input_1280x720.png"] = detector_input.copy()
                     if depth:
                         for name, key in (
                             ("estimated", "estimated"),
                             ("measured", "measured"),
                             ("display_ONLY", "display_depth"),
                         ):
-                            np.save(
-                                run / ("depth_" + name + "_f%d_m.npy" % depth["seq"]), host_array(depth[key])
-                            )
+                            snapshots["depth_" + name + "_f%d_m.npy" % depth["seq"]] = host_array(depth[key]).copy()
                 if show:
                     preview.show(canvas)
                 if args.record_offline and frame_no == 0:
@@ -615,6 +623,11 @@ def main(argv=None):
                     pool.shutdown(wait=True)
                 if preview:
                     preview.close()
+                for name, array in snapshots.items():
+                    if name.endswith(".png"):
+                        cv2.imencode(".png", array)[1].tofile(str(run / name))
+                    else:
+                        np.save(run / name, array)
                 stable = totals - warmup_totals if frame_no > 10 else totals
                 mean_ms = float(stable[1] / stable[0]) if stable[0] else None
                 summary = {
