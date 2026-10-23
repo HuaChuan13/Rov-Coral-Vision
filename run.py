@@ -17,7 +17,7 @@ import numpy as np
 from stereo import WaterGeometry, StereoDepth, observations
 from camera import Camera
 from output import read_image, save_json, host_array, compose_view, view_size, detection_records, VideoRecorder
-from vision import TargetObservation, ObservationOutput
+from vision import TargetObservation, ObservationOutput, tracking_records
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_MODEL = ROOT / "models/best.pt"
@@ -110,6 +110,9 @@ def parse_args(argv=None):
     p.add_argument("--vision-max-age", type=float, default=0.2, help="Maximum host frame age and tracking gap in seconds")
     p.add_argument("--track-min-iou", type=float, default=0.2)
     p.add_argument("--track-max-motion", type=float, default=0.5, help="Maximum center shift / previous box diagonal")
+    p.add_argument("--track-confidence", type=float, default=0.35, help="Continuation only; initial selection and recovery keep --confidence")
+    p.add_argument("--track-hold", type=float, default=0.4, help="Identity retention seconds since last accepted detection; requests invalid while waiting")
+    p.add_argument("--track-smooth-ms", type=float, default=50., help="Box/preview exponential smoothing time constant; 0 disables")
     p.add_argument("--yaw-reference", type=float, default=0.5, help="Desired horizontal position / image width")
     p.add_argument("--yaw-gain", type=float, default=10.0, help="PREVIEW gain in deg/s per normalized error")
     p.add_argument("--yaw-deadband", type=float, default=0.04, help="PREVIEW deadband relative to half image width")
@@ -134,6 +137,7 @@ def parse_args(argv=None):
         args.depth_max_age,
         args.vision_max_age, args.track_min_iou, args.track_max_motion,
         args.yaw_reference, args.yaw_gain, args.yaw_deadband, args.yaw_max_slew,
+        args.track_confidence, args.track_hold, args.track_smooth_ms,
     )
     if not np.isfinite(numeric).all() or args.exposure is not None and not np.isfinite(args.exposure):
         p.error("Expected finite numeric options.")
@@ -150,6 +154,9 @@ def parse_args(argv=None):
             or not 0 <= args.yaw_deadband < 1 or args.yaw_max_slew <= 0):
         p.error("Invalid vision or yaw preview parameter.")
     args.confidence = max(0.6, args.confidence)
+    if (not 0 < args.track_confidence <= args.confidence or args.track_hold <= 0
+            or args.track_smooth_ms < 0):
+        p.error("Invalid tracking continuation threshold, hold time or smoothing time.")
     if (
         args.frames < 0
         or args.cv_threads < 1
@@ -272,7 +279,7 @@ def main(argv=None):
     device = ("0" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
     model = YOLO(str(args.model))
     predict = dict(
-        conf=args.confidence,
+        conf=args.track_confidence,
         verbose=False,
         device=device,
         half=args.half and device != "cpu",
@@ -478,7 +485,7 @@ def main(argv=None):
                     )
                 yolo_ms = 1000 * (time.perf_counter() - detect_start)
                 # Publish fresh image observations before waiting for depth, drawing or encoding.
-                vision_records = detection_records(observations(boxes, model.names, args.confidence), geometry.size, args.confidence)
+                vision_records = tracking_records(boxes, model.names, geometry.size, args.track_confidence)
                 observer.update(vision_records, seq, stamp, time.monotonic())
                 observation = observer.packet(time.monotonic())
                 publisher.publish(observation)

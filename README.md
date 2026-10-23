@@ -68,7 +68,7 @@ Windows VC++ 运行库及 NVIDIA 驱动属于系统组件。
 顶部显示检测 FPS、当前检测源帧年龄和录像状态；底部先显示锁定与 yaw 请求预览，再显示独立深度源帧编号、年龄和最多两个目标的 XYZ（cm）。
 `frame age` 与深度 `age` 均从主机收到各自源帧时计时，不包含相机内部缓冲，也不是完整控制延迟。
 
-当前彩色画面中的锁定目标以黄色边框突出显示。底部 D1/D2 仍仅为独立深度历史帧内的编号，不对应当前锁定 ID，
+当前彩色画面中的锁定目标以平滑后的黄色边框突出显示；短暂漏检时显示橙色虚线历史框和 WAITING，转向请求立即无效。底部 D1/D2 仍仅为独立深度历史帧内的编号，不对应当前锁定 ID，
 也不是持续跟踪 ID；不会把旧 XYZ 贴到当前检测框上。更多目标保留在日志。
 没有有效测距点显示 `--`，不使用显示补洞值伪造测距；XYZ 仍只使用严格有效匹配点。
 深度尚未就绪显示 WAIT；超过 `--depth-max-age`（默认 0.75 秒）显示 STALE，并隐藏过期 XYZ。
@@ -113,12 +113,14 @@ uv run --locked python run.py --camera 0 --device cpu --show-depth
 
 ```text
 error_x = (目标中心 u - reference_u) / (图像宽度 / 2)
-preview = yaw_sign × sign(error_x) × min(yaw_max_slew, yaw_gain × max(0, abs(error_x) - yaw_deadband))
+alpha = 1 - exp(-源帧时间间隔 / 0.050秒)
+smoothed_error_x = 上次平滑偏差 + alpha × (error_x - 上次平滑偏差)
+preview = yaw_sign × sign(smoothed_error_x) × min(yaw_max_slew, yaw_gain × max(0, abs(smoothed_error_x) - yaw_deadband))
 ```
 
 默认参考点为图像宽度的 50%，不是标定光心；例如 u=800、宽度1280，对应 error_x=+0.25。
 界面的 `+25% half-width` 表示相对半幅宽度的百分比，不能当作角度。
-默认候选参数下，此例预览为 **-2.10°/s**。负号按当前 yaw 约定用于向右转向的候选映射，
+首次选择或稳定在此位置时，此例预览为 **-2.10°/s**。平滑时间常数默认50ms，可设为0关闭；首次选择和等待后恢复时重置平滑，不沿用旧位置。界面 `smooth X` 与候选预览使用平滑偏差，日志同时保留原始偏差。负号按当前 yaw 约定用于向右转向的候选映射，
 须结合相机安装和艇体 yaw 正负方向完成台架确认；这些数值尚未用于水下闭环整定。
 
 | 参数 | 默认 | 含义 |
@@ -131,12 +133,16 @@ preview = yaw_sign × sign(error_x) × min(yaw_max_slew, yaw_gain × max(0, abs(
 | `--vision-max-age` | 0.2 | 最大主机帧龄及连续关联的最大源帧间隔，秒 |
 | `--track-min-iou` | 0.2 | 后续框与前一选定框的最小交并比 |
 | `--track-max-motion` | 0.5 | 最大中心位移 / 前一框对角线长度 |
+| `--track-confidence` | 0.35 | 连续跟踪的低置信度门限；初选和等待后恢复仍用 `--confidence`，默认0.60 |
+| `--track-hold` | 0.4 | 从最后一次接受的检测起保留目标身份的秒数；等待期间请求无效 |
+| `--track-smooth-ms` | 50 | 黄色框与候选预览的指数平滑时间常数，毫秒；0关闭 |
 | `--vision-port` | 14560 | 本机 UDP 目标端口；0关闭发送；离线模式始终不发送 |
 
 候选框须类别一致，且同时满足重叠与位移门限；只有一个候选才继续锁定。
-无候选、多个候选、超时或逆序帧都会使请求无效，需要重新点击选择；不会在目标重现后自行恢复。
+连续跟踪允许置信度降至0.35，不降低新目标选择和 XYZ 测量的0.60门限。无候选时进入 WAITING，保留原锁定 ID 和最后位置；默认最多保留至最后一次接受检测后的0.4秒。期限内连续两帧出现满足关联条件、置信度至少0.60的唯一候选，才恢复同一 ID。弱候选或一次重现不能延长期限。
+超过保留期限、多个候选造成歧义、源帧过期/断流、逆序帧或人工取消，均结束锁定，需重新点击。0.4秒只容忍检测漏检，不放宽0.2秒的图像时效门限。
 该方法没有外观重识别，交叉遮挡可能造成身份混淆，需用实际录像验证；它优先拒绝可见歧义。
-低于检测置信度门限的一帧也会导致丢失；暂不以预测值维持转向。
+等待期间橙色虚线框仅表示历史位置；不会以历史位置或预测值维持转向。平滑会引入少量延迟，默认参数尚需水下录像验证。
 无效预览显示 `-- (INVALID)`，输出数值为 null；有效且居中时才输出 0°/s。
 
 最终方案 A 中，**Controller** 校验观测并重新计算转向请求，Teensy 执行
@@ -155,15 +161,18 @@ UDP 非阻塞、无重试队列；失败在界面标为 UDP ERROR，计数写入
 | `schema` | 固定 `coral.observation.v1` |
 | `session`、`observation_seq` | 每次启动的新会话和发送序号；事件序号递增不代表有新图像 |
 | `capture_seq`、`lock_id` | 源图像编号、人工选择生成的锁定编号 |
-| `valid`、`status` | 有效标记及 idle/tracking/lost/ambiguous/stale/cancelled/no_target/stopped |
+| `valid`、`status` | 有效标记及 idle/tracking/waiting/lost/ambiguous/stale/cancelled/no_target/stopped |
 | `capture_monotonic_s`、`result_monotonic_s` | PC 收到源帧和生成这条观测的单调时钟时间（秒） |
 | `source_age_ms`、`valid_for_ms` | 发送时的源帧年龄及从源帧时间起算的总有效期 |
 | `image_size`、`coordinate_frame` | 每目尺寸及固定 `rectified_left` 坐标系 |
 | `reference_u`、`principal_u` | 期望横坐标与校正后标定光心，分别记录 |
 | `target`、`center_uv`、`error_x` | 选定框/类别/置信度、中心、归一化水平偏差；无效时为 null |
-| `preview` | 候选 `yaw_target_slew_dps` 及 gain/deadband/limit_dps/sign，`sent_to_teensy=false` |
+| `smoothed_center_uv`、`smoothed_error_x` | 平滑中心和偏差；预览使用此偏差，无效时为 null；原始字段保持原语义 |
+| `track_memory` | 仅供显示的框、最后接受检测时间、年龄、保留剩余时间及恢复计数；`display_only=true`，禁止用于控制 |
+| `preview` | 候选 `yaw_target_slew_dps` 及 gain/deadband/limit_dps/sign/smooth_ms，`sent_to_teensy=false` |
 
 Controller 后续接入时必须检查 schema、数值范围、会话、锁定变化、序号和源帧年龄；
+WAITING 即使源图像新鲜也必须按 `valid=false` 停止视觉修正，所有偏差及候选请求均为 null。Controller 计划使用 `smoothed_error_x` 计算请求，避免再次叠加同类平滑；`track_memory` 不能作为有效观测。
 接收时剩余有效期按原源帧时间扣减，不能从收包时重新计时，也不能用 observation_seq 代替 capture_seq 判断新帧。
 重复发送或点击同一源帧不能延长其有效期。只有同 PC 单调时钟可直接比较；时间戳不代表曝光或视频端到端延迟。
 `preview` 用于观察与日志，不能作为不经仲裁直接发给执行器的指令。离线日志和实时日志由 settings.json 的 mode 区分。
@@ -205,7 +214,7 @@ Y = (v - cy) * Z / fy
 
 ## 当前处理配置与性能
 
-默认使用 mild 增强、YOLO `imgsz=416`、置信度至少 `0.60`、OpenCV 2 线程。
+默认使用 mild 增强、YOLO `imgsz=416`、新目标/测距置信度至少 `0.60`、OpenCV 2 线程；推理保留低至 `0.35` 的候选供已选目标连续关联。
 CUDA 模式默认 native 卷积和 FP16；CPU 模式自动关闭 FP16。
 双目匹配尺寸为 `320×180`，检测与输出视野保持每目 `1280×720`。
 

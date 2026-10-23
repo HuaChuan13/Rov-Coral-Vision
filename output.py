@@ -122,6 +122,12 @@ def compose_view(
     if color.shape != (h, w, 3):
         raise ValueError("Visualization must match the calibrated sensor grid.")
     detections = visible_detections(detections, args.confidence)
+    valid = observation is not None and observation["valid"]
+    if valid:
+        target = observation["target"]
+        # Draw the selected target once, using its smoothed yellow box below.
+        detections = [d for d in detections if not (int(d[1]) == target["class_id"] and np.allclose(
+            np.clip(d[0], [0, 0, 0, 0], [w, h, w, h]), target["box_rectified_xyxy"], atol=1))]
     view = draw_annotations(color.copy(), detections) if detections else color
     stale = depth_age_ms is not None and depth_age_ms > args.depth_max_age * 1000
     if stale:
@@ -143,10 +149,12 @@ def compose_view(
 
     state = observation["status"].upper() if observation else "IDLE"
     lock = observation["lock_id"] if observation else 0
-    valid = observation is not None and observation["valid"]
-    error = "%+.1f%% half-width" % (100 * observation["error_x"]) if valid else "--"
+    memory = observation.get("track_memory") if observation else None
+    if memory and state == "WAITING":
+        state += " %.0fms" % memory["age_ms"]
+    error = "%+.1f%% half-width" % (100 * observation["smoothed_error_x"]) if valid else "--"
     slew = "%+.2f deg/s" % observation["preview"]["yaw_target_slew_dps"] if valid else "-- (INVALID)"
-    fitted("TRACK %s | ID %d | error X %s | %s" % (state, lock, error, observation_output),
+    fitted("TRACK %s | ID %d | smooth X %s | %s" % (state, lock, error, observation_output),
            (16, h + 72), width - 32, accent, 0.65)
     fitted("Yaw target slew: %s | PREVIEW ONLY - NOT SENT TO TEENSY" % slew,
            (16, h + 98), width - 32, accent, 0.7)
@@ -157,10 +165,27 @@ def compose_view(
             if 0 <= x < w:
                 for y in range(48, 48 + h, 24):
                     cv2.line(canvas, (round(x), y), (round(x), min(48 + h - 1, y + 10)), (180, 180, 180), 1)
-        if valid:
-            x1, y1, x2, y2 = np.rint(observation["target"]["box_rectified_xyxy"]).astype(int)
-            cv2.rectangle(canvas, (max(0, x1), 48 + max(0, y1)),
-                          (min(w - 1, x2), 48 + min(h - 1, y2)), accent, 3)
+        if memory:
+            x1, y1, x2, y2 = np.rint(memory["box_xyxy"]).astype(int)
+            x1, x2 = np.clip([x1, x2], 0, w - 1)
+            y1, y2 = np.clip([y1, y2], 0, h - 1) + 48
+            tint = accent if valid else (0, 165, 255)
+            if valid:
+                cv2.rectangle(canvas, (x1, y1), (x2, y2), tint, 3)
+                label = "LOCK %d | %s %.1f%%" % (lock, target["class"], 100 * target["confidence"])
+            else:
+                for x in range(x1, x2, 18):
+                    for y in (y1, y2):
+                        cv2.line(canvas, (x, y), (min(x + 9, x2), y), tint, 2)
+                for y in range(y1, y2, 18):
+                    for x in (x1, x2):
+                        cv2.line(canvas, (x, y), (x, min(y + 9, y2)), tint, 2)
+                label = "WAIT ID %d | last position | resume %d/2" % (lock, memory["recovery_count"])
+            label_y = max(72, y1 - 8)
+            pixels = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, .6, 1)[0][0]
+            label_x = max(4, min(x1, w - pixels - 8))
+            cv2.rectangle(canvas, (label_x - 3, label_y - 21), (min(w - 1, label_x + pixels + 4), label_y + 5), (12, 12, 12), -1)
+            text(canvas, label, (label_x, label_y), tint, .6)
 
     if args.show_depth:
         # Display completion never supplies numeric XYZ measurements.

@@ -14,7 +14,7 @@ import numpy as np
 from output import compose_view
 from preview_window import canvas_point
 from run import parse_args
-from vision import TargetObservation, ObservationOutput, yaw_slew_preview
+from vision import TargetObservation, ObservationOutput, yaw_slew_preview, tracking_records
 
 
 def record(x=700, cls=0, score=0.9):
@@ -29,7 +29,7 @@ def selected(args):
     return tracker
 
 
-def check_pipeline():
+def check_pipeline(freeze=True):
     """Real main loop with simulated camera/window: freeze cannot keep a valid lock."""
     import cv2
     import torch
@@ -46,16 +46,21 @@ def check_pipeline():
     class Detector:
         names = {0: "Healthy_Coral"}
         def __init__(self, model):
-            pass
+            self.calls = 0
         def predict(self, image, **options):
-            return [SimpleNamespace(boxes=SimpleNamespace(data=torch.tensor([[700., 200., 860., 400., .9, 0.]])))]
+            assert options["conf"] == .35, "Weak detections discarded before tracking"
+            self.calls += 1
+            # Five warmups, then high -> low -> miss -> two high detections.
+            score = .9 if freeze or self.calls != 7 else .4
+            boxes = [] if not freeze and self.calls == 8 else [[700., 200., 860., 400., score, 0.]]
+            return [SimpleNamespace(boxes=SimpleNamespace(data=torch.tensor(boxes)))]
 
     class Camera:
         meta = {}
         def __init__(self, *a, **kw):
             self.seq, self.packet = -1, None
         def latest(self):
-            if self.seq == 1 and time.monotonic() - self.packet.timestamp < .3:
+            if freeze and self.seq == 1 and time.monotonic() - self.packet.timestamp < .3:
                 return self.packet
             self.seq += 1
             image = np.zeros((720, 1280, 3), np.uint8)
@@ -87,15 +92,21 @@ def check_pipeline():
         for obj, key, value in replacements:
             setattr(obj, key, value)
         with tempfile.TemporaryDirectory() as temporary, contextlib.redirect_stdout(io.StringIO()):
-            assert run.main(["--frames", "3", "--device", "cpu", "--no-depth",
+            assert run.main(["--frames", "3" if freeze else "5", "--device", "cpu", "--no-depth",
                              "--vision-port", "0", "--output", temporary]) == 0
             folder = next(Path(temporary).iterdir())
             summary = json.loads((folder / "summary.json").read_text())
             assert summary["depth_updates"] == 0 and summary["error"] is None
             assert json.loads((folder / "settings.json").read_text())["depth_policy"] == "disabled"
         assert any(p["valid"] and p["capture_seq"] == 1 for p in published)
-        assert any(p["status"] == "stale" and p["capture_seq"] == 1 for p in published)
-        assert all(not p["valid"] for p in published if p["capture_seq"] == 2)
+        if freeze:
+            assert any(p["status"] == "stale" and p["capture_seq"] == 1 for p in published)
+            assert all(not p["valid"] for p in published if p["capture_seq"] == 2)
+        else:
+            by_frame = {p["capture_seq"]: p for p in published if p["status"] != "stopped"}
+            assert by_frame[1]["valid"] and by_frame[1]["target"]["confidence"] < .6
+            assert by_frame[2]["status"] == by_frame[3]["status"] == "waiting"
+            assert by_frame[4]["valid"] and by_frame[4]["lock_id"] == by_frame[1]["lock_id"]
         assert published[-1]["status"] == "stopped"
     finally:
         for obj, key, value in originals:
@@ -126,9 +137,9 @@ def main():
     tracker.cancel()
     assert not tracker.packet(10.33)["valid"]
 
-    for detections, reason in (([], "lost"), ([record(705), record(715)], "ambiguous"),
-                               ([record(700, cls=1)], "lost"), ([record(700, score=.4)], "lost"),
-                               ([record(float("nan"))], "lost"), ([record(1100)], "lost")):
+    for detections, reason in (([], "waiting"), ([record(705), record(715)], "ambiguous"),
+                               ([record(700, cls=1)], "waiting"), ([record(700, score=.2)], "waiting"),
+                               ([record(float("nan"))], "waiting"), ([record(1100)], "waiting")):
         t = selected(args)
         t.update(detections, 1, 10.05, 10.08)
         p = t.packet(10.08)
@@ -150,6 +161,63 @@ def main():
     assert t.status == "stale"
     assert selected(args).session != selected(args).session
 
+    # Low-score detections continue an existing lock, but cannot create or recover one.
+    t = selected(args)
+    t.update([record(710, score=.4)], 1, 10.05, 10.08)
+    low = t.packet(10.08)
+    assert low["valid"] and low["lock_id"] == 1
+    assert low["center_uv"] == [790, 300] and 780 < low["smoothed_center_uv"][0] < 790
+    t.select([record(score=.4)], (750, 300), 10.05, 10.08)
+    assert not t.packet(10.08)["valid"]
+    t = selected(args)
+    t.update([], 1, 10.05, 10.08)
+    waiting = t.packet(10.08)
+    assert waiting["status"] == "waiting" and not waiting["valid"]
+    for key in ("target", "center_uv", "error_x", "smoothed_error_x", "smoothed_center_uv"):
+        assert waiting[key] is None
+    assert waiting["preview"]["yaw_target_slew_dps"] is None
+    assert waiting["track_memory"]["display_only"] and waiting["track_memory"]["last_seen_monotonic_s"] == 10.
+    t.update([record(710, score=.4)], 2, 10.1, 10.12)
+    assert not t.packet(10.12)["valid"]
+    t.update([record(710)], 3, 10.15, 10.18)
+    assert t.packet(10.18)["track_memory"]["recovery_count"] == 1
+    t.update([record(715)], 4, 10.2, 10.23)
+    recovered = t.packet(10.23)
+    assert recovered["valid"] and recovered["lock_id"] == waiting["lock_id"]
+    assert recovered["center_uv"] == recovered["smoothed_center_uv"], "Recovery retained old filter history"
+    t.cancel()
+    assert t.packet(10.24)["track_memory"] is None
+
+    # Misses / weak candidates / the first recovery match cannot extend the retention deadline.
+    t = selected(args)
+    for i, stamp in enumerate((10.05, 10.15, 10.25, 10.35), 1):
+        t.update([] if i == 1 else [record(score=.4)], i, stamp, stamp + .01)
+        assert t.packet(stamp + .01)["status"] == "waiting"
+    t.update([record()], 5, 10.39, 10.395)
+    assert not t.packet(10.395)["valid"]
+    t.update([record()], 6, 10.41, 10.42)
+    assert t.packet(10.42)["status"] == "lost"
+    t.update([record()], 7, 10.46, 10.47)
+    assert not t.packet(10.47)["valid"]
+    t = selected(args)
+    t.update([], 1, 10.05, 10.06)
+    t.update([record()], 2, 10.1, 10.11)
+    t.update([], 3, 10.15, 10.16)
+    t.update([record()], 4, 10.2, 10.21)
+    assert not t.packet(10.21)["valid"], "Recovery matches were not consecutive"
+    t.update([record(), record(705)], 5, 10.25, 10.26)
+    assert t.packet(10.26)["status"] == "ambiguous" and t.target is None
+
+    from stereo import observations
+    from output import detection_records
+    boxes = np.array([[700, 200, 860, 400, .4, 0], [100, 200, 260, 400, .9, 0]])
+    assert len(tracking_records(boxes, {0: "Coral"}, (1280, 720), .35)) == 2
+    assert len(detection_records(observations(boxes, {0: "Coral"}), (1280, 720))) == 1
+    assert not tracking_records([[700, 200, 860, 400, .8, .5]], {0: "Coral"}, (1280, 720), .35)
+    t = selected(parse_args(["--track-smooth-ms", "0"]))
+    t.update([record(710)], 1, 10.05, 10.08)
+    assert t.packet(10.08)["smoothed_center_uv"] == [790, 300]
+
     assert yaw_slew_preview(.02, 10, .04, 5, -1) == 0
     assert abs(yaw_slew_preview(.040001, 10, .04, 5, -1)) < .00002
     assert yaw_slew_preview(1., 10, .04, 5, -1) == -5
@@ -157,7 +225,9 @@ def main():
     assert yaw_slew_preview(.25, 10, .04, 5, 1) == 2.1
     for options in (["--yaw-gain", "nan"], ["--yaw-max-slew", "-1"], ["--yaw-deadband", "1"],
                     ["--vision-max-age", "0"], ["--track-min-iou", "0"],
-                    ["--vision-port", "65536"], ["--yaw-reference", "2"]):
+                    ["--vision-port", "65536"], ["--yaw-reference", "2"],
+                    ["--track-confidence", ".7"], ["--track-confidence", "0"],
+                    ["--track-hold", "0"], ["--track-hold", "nan"], ["--track-smooth-ms", "-1"]):
         with contextlib.redirect_stderr(io.StringIO()):
             try:
                 parse_args(options)
@@ -205,10 +275,16 @@ def main():
         labels.clear()
         compose_view(image, [], geometry, args, 18, False, observation=stale)
         assert any("-- (INVALID)" in s for s in labels)
-        assert not any("error X +" in s for s in labels)
+        assert not any("smooth X +" in s for s in labels)
+        labels.clear()
+        rendered = compose_view(image, [], geometry, args, 18, False, observation=waiting)
+        assert any("WAITING" in s for s in labels) and any("last position" in s for s in labels)
+        assert any("-- (INVALID)" in s for s in labels)
+        assert np.any(np.all(rendered == (0, 165, 255), axis=2)), "Missing orange waiting outline"
     finally:
         output.text = original
     check_pipeline()
+    check_pipeline(freeze=False)
     print("PASS: selection, conservative association, stale/reordered frames, slew preview, click mapping, UDP and UI")
 
 
