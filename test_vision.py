@@ -29,7 +29,7 @@ def selected(args):
     return tracker
 
 
-def check_pipeline(freeze=True):
+def check_pipeline(freeze=True, confidence=.6):
     """Real main loop with simulated camera/window: freeze cannot keep a valid lock."""
     import cv2
     import torch
@@ -51,7 +51,7 @@ def check_pipeline(freeze=True):
             assert options["conf"] == .35, "Weak detections discarded before tracking"
             self.calls += 1
             # Five warmups, then high -> low -> miss -> two high detections.
-            score = .9 if freeze or self.calls != 7 else .4
+            score = confidence + .05 if freeze or self.calls != 7 else .4
             boxes = [] if not freeze and self.calls == 8 else [[700., 200., 860., 400., score, 0.]]
             return [SimpleNamespace(boxes=SimpleNamespace(data=torch.tensor(boxes)))]
 
@@ -93,6 +93,7 @@ def check_pipeline(freeze=True):
             setattr(obj, key, value)
         with tempfile.TemporaryDirectory() as temporary, contextlib.redirect_stdout(io.StringIO()):
             assert run.main(["--frames", "3" if freeze else "5", "--device", "cpu", "--no-depth",
+                             "--confidence", str(confidence),
                              "--vision-port", "0", "--output", temporary]) == 0
             folder = next(Path(temporary).iterdir())
             summary = json.loads((folder / "summary.json").read_text())
@@ -213,6 +214,24 @@ def main():
     boxes = np.array([[700, 200, 860, 400, .4, 0], [100, 200, 260, 400, .9, 0]])
     assert len(tracking_records(boxes, {0: "Coral"}, (1280, 720), .35)) == 2
     assert len(detection_records(observations(boxes, {0: "Coral"}), (1280, 720))) == 1
+    # One CLI setting reaches display/logging, click selection and two-frame recovery.
+    for threshold in (.5, .3):
+        tuned = parse_args(["--confidence", str(threshold)])
+        assert tuned.confidence == threshold and tuned.track_confidence == min(.35, threshold)
+        candidates = np.array([[700, 200, 860, 400, threshold + .01, 0],
+                               [100, 200, 260, 400, threshold - .01, 0]])
+        found = observations(candidates, {0: "Coral"}, tuned.confidence)
+        records = detection_records(found, (1280, 720), tuned.confidence)
+        assert len(records) == 1 and records[0]["confidence"] < .6
+        t = TargetObservation((1280, 720), tuned, 797.55)
+        t.update(records, 0, 10., 10.01)
+        t.select(records, (750, 300), 10., 10.02)
+        assert t.packet(10.02)["valid"]
+        t.update([], 1, 10.05, 10.06)
+        t.update(records, 2, 10.1, 10.11)
+        assert not t.packet(10.11)["valid"]
+        t.update(records, 3, 10.15, 10.16)
+        assert t.packet(10.16)["valid"]
     assert not tracking_records([[700, 200, 860, 400, .8, .5]], {0: "Coral"}, (1280, 720), .35)
     t = selected(parse_args(["--track-smooth-ms", "0"]))
     t.update([record(710)], 1, 10.05, 10.08)
@@ -224,6 +243,8 @@ def main():
     assert yaw_slew_preview(-1., 10, .04, 5, -1) == 5
     assert yaw_slew_preview(.25, 10, .04, 5, 1) == 2.1
     for options in (["--yaw-gain", "nan"], ["--yaw-max-slew", "-1"], ["--yaw-deadband", "1"],
+                    ["--confidence", "0"], ["--confidence", "60"], ["--confidence", "nan"],
+                    ["--confidence", ".3", "--track-confidence", ".35"],
                     ["--vision-max-age", "0"], ["--track-min-iou", "0"],
                     ["--vision-port", "65536"], ["--yaw-reference", "2"],
                     ["--track-confidence", ".7"], ["--track-confidence", "0"],
@@ -285,6 +306,7 @@ def main():
         output.text = original
     check_pipeline()
     check_pipeline(freeze=False)
+    check_pipeline(freeze=False, confidence=.5)
     print("PASS: selection, conservative association, stale/reordered frames, slew preview, click mapping, UDP and UI")
 
 

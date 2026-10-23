@@ -364,7 +364,7 @@ def observations(boxes, names, confidence=0.6, depth=None, geometry=None, min_po
     """Attach XYZ only when supplied depth belongs to these exact boxes/frame."""
     found = []
     for row in boxes:
-        if not np.isfinite(row).all() or row[4] < max(0.6, confidence):
+        if not np.isfinite(row).all() or row[4] < confidence:
             continue
         box, score, cls = row[:4], float(row[4]), int(row[5])
         if box[2] <= box[0] or box[3] <= box[1]:

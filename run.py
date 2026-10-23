@@ -82,7 +82,7 @@ def parse_args(argv=None):
         help="Photometric enhancement for detection/display only, preserving stereo measurement inputs",
     )
     p.add_argument("--imgsz", type=int, default=416)
-    p.add_argument("--confidence", type=float, default=0.6)
+    p.add_argument("--confidence", type=float, default=0.6, help="Detection, initial selection and recovery threshold (0 < value <= 1; default: 0.6)")
     p.add_argument("--stereo-width", type=int, choices=(320, 640, 1280), default=320)
     p.add_argument("--num-disparities", type=int, default=0)
     p.add_argument("--block-size", type=int, default=3)
@@ -110,7 +110,7 @@ def parse_args(argv=None):
     p.add_argument("--vision-max-age", type=float, default=0.2, help="Maximum host frame age and tracking gap in seconds")
     p.add_argument("--track-min-iou", type=float, default=0.2)
     p.add_argument("--track-max-motion", type=float, default=0.5, help="Maximum center shift / previous box diagonal")
-    p.add_argument("--track-confidence", type=float, default=0.35, help="Continuation only; initial selection and recovery keep --confidence")
+    p.add_argument("--track-confidence", type=float, default=None, help="Continuation threshold; default: min(0.35, --confidence); cannot exceed --confidence")
     p.add_argument("--track-hold", type=float, default=0.4, help="Identity retention seconds since last accepted detection; requests invalid while waiting")
     p.add_argument("--track-smooth-ms", type=float, default=50., help="Box/preview exponential smoothing time constant; 0 disables")
     p.add_argument("--yaw-reference", type=float, default=0.5, help="Desired horizontal position / image width")
@@ -124,6 +124,8 @@ def parse_args(argv=None):
         "--stop-file", type=Path, default=None, help="Graceful external stop, also finalizes a recording"
     )
     args = p.parse_args(argv)
+    if args.track_confidence is None:
+        args.track_confidence = min(0.35, args.confidence)
     args.live = args.offline is None and not args.capture_only
     numeric = (
         args.near,
@@ -153,7 +155,6 @@ def parse_args(argv=None):
             or not 0 <= args.yaw_reference <= 1 or args.yaw_gain <= 0
             or not 0 <= args.yaw_deadband < 1 or args.yaw_max_slew <= 0):
         p.error("Invalid vision or yaw preview parameter.")
-    args.confidence = max(0.6, args.confidence)
     if (not 0 < args.track_confidence <= args.confidence or args.track_hold <= 0
             or args.track_smooth_ms < 0):
         p.error("Invalid tracking continuation threshold, hold time or smoothing time.")

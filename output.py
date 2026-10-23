@@ -36,7 +36,7 @@ def text(image, label, xy, color=(235, 235, 235), scale=0.48):
 
 def visible_detections(detections, threshold=0.6):
     """Display/log safety gate, independent of YOLO's own confidence filter."""
-    cutoff = max(0.6, float(threshold))
+    cutoff = float(threshold)
     return [d for d in detections if np.isfinite(d[2]) and float(d[2]) >= cutoff]
 
 
