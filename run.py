@@ -17,6 +17,7 @@ import numpy as np
 from stereo import WaterGeometry, StereoDepth, observations
 from camera import Camera
 from output import read_image, save_json, host_array, compose_view, view_size, detection_records, VideoRecorder
+from vision import TargetObservation, ObservationOutput
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_MODEL = ROOT / "models/best.pt"
@@ -29,6 +30,8 @@ def key_action(key):
         return "record"
     if key in (ord("w"), ord("W"), 27):
         return "exit"
+    if key in (ord("c"), ord("C")):
+        return "cancel"
     return None
 
 
@@ -102,6 +105,16 @@ def parse_args(argv=None):
     p.add_argument("--frames", type=int, default=0, help="0: live unlimited, offline 120, capture-only 150")
     p.add_argument("--show-offline", action="store_true")
     p.add_argument("--show-depth", action="store_true", help="Show the depth debug panel beside the left image")
+    p.add_argument("--depth", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--vision-port", type=int, default=14560, help="Localhost UDP observations; 0 disables; offline never sends")
+    p.add_argument("--vision-max-age", type=float, default=0.2, help="Maximum host frame age and tracking gap in seconds")
+    p.add_argument("--track-min-iou", type=float, default=0.2)
+    p.add_argument("--track-max-motion", type=float, default=0.5, help="Maximum center shift / previous box diagonal")
+    p.add_argument("--yaw-reference", type=float, default=0.5, help="Desired horizontal position / image width")
+    p.add_argument("--yaw-gain", type=float, default=10.0, help="PREVIEW gain in deg/s per normalized error")
+    p.add_argument("--yaw-deadband", type=float, default=0.04, help="PREVIEW deadband relative to half image width")
+    p.add_argument("--yaw-max-slew", type=float, default=5.0, help="PREVIEW heading target slew limit deg/s")
+    p.add_argument("--yaw-sign", type=int, choices=(-1, 1), default=-1, help="PREVIEW direction; verify camera/body sign on bench")
     p.add_argument("--record-offline", action="store_true", help="Test encoding without camera")
     p.add_argument("--output", type=Path, default=ROOT / "coral_runs")
     p.add_argument(
@@ -119,6 +132,8 @@ def parse_args(argv=None):
         args.capture_fps,
         0 if args.depth_fps == "max" else args.depth_fps,
         args.depth_max_age,
+        args.vision_max_age, args.track_min_iou, args.track_max_motion,
+        args.yaw_reference, args.yaw_gain, args.yaw_deadband, args.yaw_max_slew,
     )
     if not np.isfinite(numeric).all() or args.exposure is not None and not np.isfinite(args.exposure):
         p.error("Expected finite numeric options.")
@@ -129,6 +144,11 @@ def parse_args(argv=None):
         p.error("Invalid camera index, capture/depth frequency or depth age limit.")
     if not 0 < args.near < args.far or not 0 < args.confidence <= 1:
         p.error("Invalid distance range/confidence.")
+    if (not 0 <= args.vision_port <= 65535 or args.vision_max_age <= 0
+            or not 0 < args.track_min_iou <= 1 or args.track_max_motion <= 0
+            or not 0 <= args.yaw_reference <= 1 or args.yaw_gain <= 0
+            or not 0 <= args.yaw_deadband < 1 or args.yaw_max_slew <= 0):
+        p.error("Invalid vision or yaw preview parameter.")
     args.confidence = max(0.6, args.confidence)
     if (
         args.frames < 0
@@ -239,7 +259,7 @@ def main(argv=None):
     if not args.model.is_file():
         raise FileNotFoundError("Trained coral model not found: " + str(args.model))
     geometry = WaterGeometry(args.calibration, args.stereo_width)
-    matcher = StereoDepth(geometry, args)
+    matcher = StereoDepth(geometry, args) if args.depth else None
     os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
     import torch
     from ultralytics import YOLO
@@ -260,7 +280,8 @@ def main(argv=None):
     )
     for _ in range(5):
         model.predict(np.zeros((geometry.size[1], geometry.size[0], 3), np.uint8), **predict)
-    matcher.enable_gpu_reconstruction(device)
+    if matcher:
+        matcher.enable_gpu_reconstruction(device)
     cv2.setNumThreads(args.cv_threads)
     run = args.output / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     run.mkdir(parents=True, exist_ok=False)
@@ -275,8 +296,8 @@ def main(argv=None):
         "geometry": geometry.metadata(),
         "input_enhancement": enhancer.metadata(),
         "inference_half": predict["half"],
-        "num_disparities": matcher.nd,
-        "depth_policy": "same-frame synchronous"
+        "num_disparities": matcher.nd if matcher else None,
+        "depth_policy": "disabled" if not args.depth else "same-frame synchronous"
         if args.depth_fps == 0
         else "one bounded asynchronous job; separate frame IDs",
         "warning": "Host arrival times do not establish sensor exposure synchronization; range accuracy unverified.",
@@ -289,7 +310,7 @@ def main(argv=None):
         "| device:",
         device,
         "| depth:",
-        args.depth_fps,
+        args.depth_fps if args.depth else "off",
         "(max=uncapped async; positive=Hz; 0=synchronous)",
         flush=True,
     )
@@ -305,8 +326,27 @@ def main(argv=None):
     frame_no, previous_seq, skipped = 0, -1, 0
     pending, depth, next_depth = None, None, 0.0
     timer, error = False, None
+    observer = TargetObservation(geometry.color_size, args, geometry.P1[0, 2])
+    publisher, observation = None, None
+    records, stamp, last_render = [], None, 0.0
+    saved_lock_preview = False
     began = time.perf_counter()
+
+    def render_current(now):
+        nonlocal observation
+        if observer.expire(now):
+            observation = observer.packet(now)
+            publisher.publish(observation)
+        return compose_view(
+            detector_input, found, geometry, args, frame_rate(stamps), recorder.active,
+            depth=depth, depth_fps=frame_rate(depth_stamps),
+            depth_age_ms=1000 * (now - depth["stamp"]) if depth else None,
+            detection_age_ms=1000 * (now - stamp), observation=observation,
+            observation_output=publisher.status,
+        )
+
     try:
+        publisher = ObservationOutput(run, args.vision_port if args.live else 0)
         offline = []
         if args.offline:
             for lp in sorted((args.offline / "original").glob("*_left.png"))[:12]:
@@ -366,10 +406,29 @@ def main(argv=None):
                     break
                 if action == "record" and canvas is not None:
                     recorder.start(canvas, time.perf_counter())
+                click = preview.pop_click() if preview else None
+                if action == "cancel" or click and click[0] == "cancel":
+                    observer.cancel()
+                    observation = observer.packet(time.monotonic())
+                    publisher.publish(observation)
+                elif click and stamp is not None:
+                    x, y = click[1]
+                    if 0 <= x < geometry.size[0] and 48 <= y < 48 + geometry.size[1]:
+                        observer.select(records, (x, y - 48), stamp, time.monotonic())
+                        observation = observer.packet(time.monotonic())
+                        publisher.publish(observation)
                 updated = False
                 if camera:
                     packet = camera.latest()
                     if packet.seq == previous_seq:
+                        now = time.monotonic()
+                        if observer.expire(now):
+                            observation = observer.packet(now)
+                            publisher.publish(observation)
+                        if show and frame_no and now - last_render >= 0.1:
+                            canvas = render_current(now)
+                            preview.show(canvas)
+                            last_render = now
                         time.sleep(0.001)
                         continue
                     left, right, stamp, seq, capture_fps = (
@@ -393,7 +452,7 @@ def main(argv=None):
                     log_depth(depth_log, depth)
                 start = time.perf_counter()
                 color = geometry.rectify_left(left)
-                scheduled = pending is None and (args.depth_fps == 0 or time.monotonic() >= next_depth)
+                scheduled = args.depth and pending is None and (args.depth_fps == 0 or time.monotonic() >= next_depth)
                 if scheduled:
                     pending = dict(
                         future=pool.submit(matcher.compute_frame, color, right),
@@ -418,9 +477,14 @@ def main(argv=None):
                         else np.empty((0, 6))
                     )
                 yolo_ms = 1000 * (time.perf_counter() - detect_start)
+                # Publish fresh image observations before waiting for depth, drawing or encoding.
+                vision_records = detection_records(observations(boxes, model.names, args.confidence), geometry.size, args.confidence)
+                observer.update(vision_records, seq, stamp, time.monotonic())
+                observation = observer.packet(time.monotonic())
+                publisher.publish(observation)
                 if scheduled:
                     pending["boxes"] = boxes
-                if args.depth_fps == 0:
+                if args.depth and args.depth_fps == 0:
                     depth = finish_depth(pending, model.names, args)
                     pending, updated = None, True
                     depth_totals += (1, depth["stereo_ms"])
@@ -437,20 +501,13 @@ def main(argv=None):
                 records = detection_records(found, geometry.size, args.confidence)
                 age_ms = max(0.0, 1000 * (time.monotonic() - stamp))
                 fps = frame_rate(stamps)
-                canvas = compose_view(
-                    detector_input,
-                    found,
-                    geometry,
-                    args,
-                    fps,
-                    recorder.active,
-                    depth=depth if usable else None,
-                    depth_fps=frame_rate(depth_stamps),
-                    depth_age_ms=depth_age_ms,
-                    detection_age_ms=age_ms,
-                )
+                last_render = time.monotonic()
+                canvas = render_current(last_render)
                 if frame_no in (0, 29):
                     cv2.imencode(".png", canvas)[1].tofile(str(run / "preview.png"))
+                if observation["valid"] and not saved_lock_preview:
+                    cv2.imencode(".png", canvas)[1].tofile(str(run / "preview_locked.png"))
+                    saved_lock_preview = True
                 if frame_no == 29:
                     cv2.imencode(".png", color)[1].tofile(str(run / "left_rectified_1280x720.png"))
                     cv2.imencode(".png", detector_input)[1].tofile(str(run / "detection_input_1280x720.png"))
@@ -511,6 +568,7 @@ def main(argv=None):
                     log.flush()
                     detections_log.flush()
                     depth_log.flush()
+                    publisher.log.flush()
                     print(
                         "Detection %.1f FPS | capture %.1f FPS | depth %.1f Hz"
                         % (fps, capture_fps, frame_rate(depth_stamps)),
@@ -530,39 +588,48 @@ def main(argv=None):
         raise
     finally:
         try:
-            recorder.close()
+            if publisher:
+                observer.cancel("stopped")
+                try:
+                    publisher.publish(observer.packet(time.monotonic()))
+                finally:
+                    publisher.close()
         finally:
-            if camera:
-                camera.close()
-            if timer:
-                ctypes.WinDLL("winmm").timeEndPeriod(1)
-            if pool:
-                pool.shutdown(wait=True)
-            if preview:
-                preview.close()
-            stable = totals - warmup_totals if frame_no > 10 else totals
-            mean_ms = float(stable[1] / stable[0]) if stable[0] else None
-            summary = {
-                "processed_frames": frame_no,
-                "mode": meta["mode"],
-                "error": error,
-                "run_wall_s": time.perf_counter() - began,
-                "skipped_camera_frames": skipped,
-                "mean_processing_ms_excluding_first10": mean_ms,
-                "processing_capacity_fps": 1000 / mean_ms if mean_ms else None,
-                "last_window_fresh_fps": frame_rate(stamps),
-                "depth_updates": int(depth_totals[0]),
-                "depth_update_hz": frame_rate(depth_stamps),
-                "mean_stereo_ms": float(depth_totals[1] / depth_totals[0]) if depth_totals[0] else None,
-                "live_FPS_verified": bool(args.live and frame_no >= 120),
-                "distance_accuracy_verified": geometry.verified,
-                "input_enhancement": enhancer.metadata(),
-                "mean_enhancement_ms": float(stable[2] / stable[0]) if stable[0] else None,
-                "recording": str(recorder.path) if recorder.path else None,
-                "note": "Detection FPS and depth update Hz are separate; encoded holds are not new observations.",
-            }
-            save_json(run / "summary.json", summary)
-            print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+            try:
+                recorder.close()
+            finally:
+                if camera:
+                    camera.close()
+                if timer:
+                    ctypes.WinDLL("winmm").timeEndPeriod(1)
+                if pool:
+                    pool.shutdown(wait=True)
+                if preview:
+                    preview.close()
+                stable = totals - warmup_totals if frame_no > 10 else totals
+                mean_ms = float(stable[1] / stable[0]) if stable[0] else None
+                summary = {
+                    "processed_frames": frame_no,
+                    "mode": meta["mode"],
+                    "error": error,
+                    "run_wall_s": time.perf_counter() - began,
+                    "skipped_camera_frames": skipped,
+                    "mean_processing_ms_excluding_first10": mean_ms,
+                    "processing_capacity_fps": 1000 / mean_ms if mean_ms else None,
+                    "last_window_fresh_fps": frame_rate(stamps),
+                    "depth_updates": int(depth_totals[0]),
+                    "depth_update_hz": frame_rate(depth_stamps),
+                    "mean_stereo_ms": float(depth_totals[1] / depth_totals[0]) if depth_totals[0] else None,
+                    "live_FPS_verified": bool(args.live and frame_no >= 120),
+                    "distance_accuracy_verified": geometry.verified,
+                    "input_enhancement": enhancer.metadata(),
+                    "mean_enhancement_ms": float(stable[2] / stable[0]) if stable[0] else None,
+                    "recording": str(recorder.path) if recorder.path else None,
+                    "vision_udp_errors": publisher.errors if publisher else 0,
+                    "note": "Detection FPS and depth update Hz are separate; encoded holds are not new observations.",
+                }
+                save_json(run / "summary.json", summary)
+                print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
     return 0
 
 

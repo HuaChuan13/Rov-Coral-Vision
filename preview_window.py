@@ -7,6 +7,13 @@ import os
 import cv2
 
 
+def canvas_point(x, y, fitted_rect, size):
+    left, top, width, height = fitted_rect
+    if not left <= x < left + width or not top <= y < top + height:
+        return None
+    return ((x - left) * size[0] / width, (y - top) * size[1] / height)
+
+
 def constrain_rect(rect, edge, size, border, current):
     """Constrain a WM_SIZING outer rectangle, anchoring the opposite edges."""
     ratio = size[0] / size[1]
@@ -34,6 +41,7 @@ def constrain_rect(rect, edge, size, border, current):
 class PreviewWindow:
     def __init__(self, name, size):
         self.name, self.size = name, tuple(size)
+        self.click, self.fitted_rect = None, None
         self.user32 = C.WinDLL('user32', use_last_error=True)
         self.comctl32 = C.WinDLL('comctl32', use_last_error=True)
         self.hwnd = None
@@ -69,6 +77,7 @@ class PreviewWindow:
                 raise RuntimeError('Cannot find the OpenCV window on the current thread.')
             if not self.comctl32.SetWindowSubclass(self.hwnd, self.callback, 1, 0):
                 raise RuntimeError('Cannot install fixed-aspect window resizing.')
+            cv2.setMouseCallback(self.name, self._mouse)
         except BaseException:
             cv2.destroyWindow(self.name)
             raise
@@ -87,6 +96,18 @@ class PreviewWindow:
             self.comctl32.RemoveWindowSubclass(hwnd, self.callback, subclass_id)
         return self.comctl32.DefSubclassProc(hwnd, message, edge, address)
 
+    def _mouse(self, event, x, y, flags, userdata):
+        if event == cv2.EVENT_RBUTTONDOWN:
+            self.click = ("cancel", None)
+        elif event == cv2.EVENT_LBUTTONDOWN and self.fitted_rect:
+            point = canvas_point(x, y, self.fitted_rect, self.size)
+            if point is not None:
+                self.click = ("select", point)
+
+    def pop_click(self):
+        click, self.click = self.click, None
+        return click
+
     def show(self, image):
         if image.shape[1::-1] != self.size:
             raise ValueError('Preview canvas dimensions changed.')
@@ -98,6 +119,7 @@ class PreviewWindow:
                   min(height, max(1, round(self.size[1]*scale))))
         view = cv2.resize(image, fitted, interpolation=cv2.INTER_LINEAR) if fitted != self.size else image
         x, y = (width-fitted[0])//2, (height-fitted[1])//2
+        self.fitted_rect = (x, y, *fitted)
         if fitted != (width, height):
             view = cv2.copyMakeBorder(view, y, height-fitted[1]-y,
                                      x, width-fitted[0]-x, cv2.BORDER_CONSTANT, value=(25, 25, 25))

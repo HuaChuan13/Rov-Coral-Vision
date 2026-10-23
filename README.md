@@ -2,7 +2,7 @@
 
 普通 USB 左右拼接双目相机的实时珊瑚检测、图像增强和水下标定测距程序。使用 uv 管理 Python 和依赖。
 
-后续开发见 [珊瑚 yaw 视觉闭环计划](PLAN.md)：已确认网线传视频、USB 直连 Teensy 的双线部署和方案 A（视觉偏差 → 目标航向变化速度 → Teensy 更新目标 yaw → 原有双环），尚未实现。
+后续开发见 [珊瑚 yaw 视觉闭环计划](PLAN.md)：已确认网线传视频、USB 直连 Teensy 的双线部署和方案 A（视觉偏差 → 目标航向变化速度 → Teensy 更新目标 yaw → 原有双环），已实现本地目标锁定、观测输出和转向请求预览；网络接入、Controller 与 Teensy 执行仍待开发。
 
 ## 安装与启动
 
@@ -56,6 +56,8 @@ Windows VC++ 运行库及 NVIDIA 驱动属于系统组件。
 
 | 操作 | 效果 |
 |---|---|
+| 左键点击左目检测框 | 选择同一株珊瑚进行关联，重叠框有歧义时拒绝选择 |
+| 右键或 `C` | 取消选择 |
 | `Q` | 开始录制 |
 | `W` 或 `Esc` | 保存录像并退出 |
 | 拖动窗口四边或四角 | 宽高按画布比例联动缩放 |
@@ -63,10 +65,10 @@ Windows VC++ 运行库及 NVIDIA 驱动属于系统组件。
 
 默认只显示左目增强彩色画面、检测框、类别和置信度，右目继续在后台参与异步测距。
 识别尺寸保持 `--imgsz 416`，深度匹配保持 `--stereo-width 320`；相机每目仍为 `1280×720`。
-顶部显示检测 FPS、当前检测源帧年龄和录像状态；底部显示最新深度源帧编号、年龄和最多两个目标的 XYZ（cm）。
+顶部显示检测 FPS、当前检测源帧年龄和录像状态；底部先显示锁定与 yaw 请求预览，再显示独立深度源帧编号、年龄和最多两个目标的 XYZ（cm）。
 `frame age` 与深度 `age` 均从主机收到各自源帧时计时，不包含相机内部缓冲，也不是完整控制延迟。
 
-目前没有跨帧目标锁定。底部 D1/D2 仅为深度历史帧内的编号，不对应当前彩色画面的目标编号，
+当前彩色画面中的锁定目标以黄色边框突出显示。底部 D1/D2 仍仅为独立深度历史帧内的编号，不对应当前锁定 ID，
 也不是持续跟踪 ID；不会把旧 XYZ 贴到当前检测框上。更多目标保留在日志。
 没有有效测距点显示 `--`，不使用显示补洞值伪造测距；XYZ 仍只使用严格有效匹配点。
 深度尚未就绪显示 WAIT；超过 `--depth-max-age`（默认 0.75 秒）显示 STALE，并隐藏过期 XYZ。
@@ -78,8 +80,8 @@ Windows VC++ 运行库及 NVIDIA 驱动属于系统组件。
 uv run --locked python run.py --camera 0 --device cpu --show-depth
 ```
 
-左目图像始终为 `1280×720`（`16:9`），含上下信息栏的默认画布为 `1280×880`；
-启用深度调试面板后为 `2688×880`。窗口始终按所选完整画布的比例缩放，图像不会拉伸。
+左目图像始终为 `1280×720`（`16:9`），含上下信息栏的默认画布为 `1280×928`；
+启用深度调试面板后为 `2688×928`。窗口始终按所选完整画布的比例缩放，图像不会拉伸。
 缩放限制考虑标题栏和边框；预览缩放不改变标定、计算或录像尺寸。
 隐藏深度面板只改变显示，后台深度算法与异步调度不变。
 
@@ -89,6 +91,8 @@ uv run --locked python run.py --camera 0 --device cpu --show-depth
 |---|---|
 | `visualization.mp4` | 按 Q 后保存的完整画面；MP4 编码不可用时回退到 AVI |
 | `detections.jsonl` | 每个新检测帧的编号、时间、帧龄、检测框和置信度；XYZ 仅在与深度同帧时附带 |
+| `vision_observations.jsonl` | 每帧及选择/取消/过期/退出事件的视觉观测与候选转向预览 |
+| `preview_locked.png` | 本次首次有效锁定时的原始完整预览 |
 | `depth_measurements.jsonl` | 每次完成的深度帧、源时间、计算耗时，以及该帧检测框对应的 XYZ |
 | `frame_metrics.csv` | 采集 FPS、实际处理 FPS、帧龄及各阶段耗时 |
 | `settings.json`、`camera.json` | 本次参数、计算设备与实际相机模式 |
@@ -96,6 +100,86 @@ uv run --locked python run.py --camera 0 --device cpu --show-depth
 | `calibration_snapshot.json` | 本次使用的标定快照 |
 
 视频容器的 30 FPS 包含保持上一帧的编码，**不代表每秒有 30 个新识别结果**。
+
+## 目标锁定与 yaw 请求预览（第二步）
+
+使用默认参数启动后，**左键点击检测框**。黄色边框代表选定目标，底部显示 TRACK 状态、锁定 ID、
+水平偏差和 `Yaw target slew`（目标航向变化速度，°/s）。右键或 C 取消；关闭程序重启后需要重新选择。
+期望位置与中央死区以三条竖虚线标示。像素偏差采用校正后左目坐标，缩放/留边不改变坐标。
+
+这一步仅输出观测和候选请求，**不会连接串口或驱动 Teensy**。`PREVIEW ONLY - NOT SENT TO TEENSY`
+表示未下发；`UDP SENT (no ACK)` 只表示本机发送成功，不能据此判断 Controller 在线或 Teensy 接受了请求。
+首版 yaw 不依赖 XYZ，深度无有效值时仍可计算水平偏差。D1/D2 测距列表暂不与锁定目标做跨帧绑定。
+
+```text
+error_x = (目标中心 u - reference_u) / (图像宽度 / 2)
+preview = yaw_sign × sign(error_x) × min(yaw_max_slew, yaw_gain × max(0, abs(error_x) - yaw_deadband))
+```
+
+默认参考点为图像宽度的 50%，不是标定光心；例如 u=800、宽度1280，对应 error_x=+0.25。
+界面的 `+25% half-width` 表示相对半幅宽度的百分比，不能当作角度。
+默认候选参数下，此例预览为 **-2.10°/s**。负号按当前 yaw 约定用于向右转向的候选映射，
+须结合相机安装和艇体 yaw 正负方向完成台架确认；这些数值尚未用于水下闭环整定。
+
+| 参数 | 默认 | 含义 |
+|---|---:|---|
+| `--yaw-reference` | 0.5 | 期望水平位置 / 全图宽度 |
+| `--yaw-gain` | 10 | 每单位归一化偏差对应的目标航向变化速度，°/s |
+| `--yaw-deadband` | 0.04 | 半幅宽度的4%，等价于中心左右各全图宽度2% |
+| `--yaw-max-slew` | 5 | 目标航向变化速度幅值上限，°/s |
+| `--yaw-sign` | -1 | 候选方向系数，可设为 +1，必须台架核对 |
+| `--vision-max-age` | 0.2 | 最大主机帧龄及连续关联的最大源帧间隔，秒 |
+| `--track-min-iou` | 0.2 | 后续框与前一选定框的最小交并比 |
+| `--track-max-motion` | 0.5 | 最大中心位移 / 前一框对角线长度 |
+| `--vision-port` | 14560 | 本机 UDP 目标端口；0关闭发送；离线模式始终不发送 |
+
+候选框须类别一致，且同时满足重叠与位移门限；只有一个候选才继续锁定。
+无候选、多个候选、超时或逆序帧都会使请求无效，需要重新点击选择；不会在目标重现后自行恢复。
+该方法没有外观重识别，交叉遮挡可能造成身份混淆，需用实际录像验证；它优先拒绝可见歧义。
+低于检测置信度门限的一帧也会导致丢失；暂不以预测值维持转向。
+无效预览显示 `-- (INVALID)`，输出数值为 null；有效且居中时才输出 0°/s。
+
+最终方案 A 中，**Controller** 校验观测并重新计算转向请求，Teensy 执行
+`yaw_target += yaw_target_slew_dps × dt`，再走现有角度外环和角速度内环。
+此处预览不等同于艇体角速度目标，也不提供绝对 yaw；居中滞回、目标角收拢、领先量限制和手柄仲裁属于后续控制接入。
+
+### 本机观测接口
+
+实时模式每个检测帧先于深度等待、绘图和录像发送一个 UTF-8 JSON UDP 数据报到 `127.0.0.1:14560`，
+不绑定串口，不经 VOFA。选择、取消、已锁定目标过期及正常退出也发布状态事件。
+UDP 非阻塞、无重试队列；失败在界面标为 UDP ERROR，计数写入 summary。
+所有观测另写入 `vision_observations.jsonl`；强制杀进程无法保证发出最终无效包，接收端必须独立超时。
+
+| 字段 | 含义 |
+|---|---|
+| `schema` | 固定 `coral.observation.v1` |
+| `session`、`observation_seq` | 每次启动的新会话和发送序号；事件序号递增不代表有新图像 |
+| `capture_seq`、`lock_id` | 源图像编号、人工选择生成的锁定编号 |
+| `valid`、`status` | 有效标记及 idle/tracking/lost/ambiguous/stale/cancelled/no_target/stopped |
+| `capture_monotonic_s`、`result_monotonic_s` | PC 收到源帧和生成这条观测的单调时钟时间（秒） |
+| `source_age_ms`、`valid_for_ms` | 发送时的源帧年龄及从源帧时间起算的总有效期 |
+| `image_size`、`coordinate_frame` | 每目尺寸及固定 `rectified_left` 坐标系 |
+| `reference_u`、`principal_u` | 期望横坐标与校正后标定光心，分别记录 |
+| `target`、`center_uv`、`error_x` | 选定框/类别/置信度、中心、归一化水平偏差；无效时为 null |
+| `preview` | 候选 `yaw_target_slew_dps` 及 gain/deadband/limit_dps/sign，`sent_to_teensy=false` |
+
+Controller 后续接入时必须检查 schema、数值范围、会话、锁定变化、序号和源帧年龄；
+接收时剩余有效期按原源帧时间扣减，不能从收包时重新计时，也不能用 observation_seq 代替 capture_seq 判断新帧。
+重复发送或点击同一源帧不能延长其有效期。只有同 PC 单调时钟可直接比较；时间戳不代表曝光或视频端到端延迟。
+`preview` 用于观察与日志，不能作为不经仲裁直接发给执行器的指令。离线日志和实时日志由 settings.json 的 mode 区分。
+
+```powershell
+# 保持原来的异步深度与默认分辨率
+uv run --locked python run.py --camera 0 --device cpu
+
+# 仅验证识别和 yaw 观测，明确关闭深度计算
+uv run --locked python run.py --camera 0 --device cpu --no-depth
+
+# 不发送 UDP，仍显示并记录观测
+uv run --locked python run.py --camera 0 --device cpu --vision-port 0
+
+uv run --locked python test_vision.py
+```
 
 ## 相机、标定与 XYZ
 
@@ -176,7 +260,7 @@ USB 查询确认相机为 USB 2.0 High-Speed 设备；目前没有证据证明�
 详细记录见本机 `coral_runs/capture_diagnosis_20261021/REPORT.md`（运行记录不纳入 Git）。
 
 上述处理有并行，耗时不能直接相加。帧龄是主机收帧到检测结束的统计，不包含相机内部缓冲、后续显示和通信，不是完整的相机到控制器延迟。
-这些数据用于比较后续改动，不保证不同场景或电脑上的速度；当前没有新增 GPU 加速或跟踪控制接口。
+这些数据用于比较后续改动，不保证不同场景或电脑上的速度；这些历史数据对应当时版本；没有新增 GPU 加速。
 
 2026-10-22，整理测距画面后，CPU、预览开启、录制关闭，各运行 150 帧的实机对照：
 
@@ -204,6 +288,7 @@ uv run --locked python run.py --camera 0 --device cpu
 | `stereo.py` | JSON 标定、SGBM/WLS、同帧 XYZ、公共补洞与 CPU 深度显示 |
 | `gpu_depth.py` | NVIDIA CUDA 重建和内核 |
 | `image_enhancement.py` | 图像增强 |
+| `vision.py` | 单目标关联、水平偏差与请求预览、本机 UDP 和观测日志 |
 | `output.py` | 独立检测记录、画面绘制与录像 |
 | `preview_window.py` | Windows 预览窗口比例约束与等比例显示 |
 | `models/best.pt`、`config/` | 模型和对应标定 |
@@ -242,7 +327,7 @@ uv run --locked python run.py --offline "D:\datasets\stereo" --frames 30 --devic
 `--exposure` 可按设备驱动单位指定曝光，默认不改当前曝光设置。不要把更短曝光带来的暗画面当作无代价提速。
 
 `test_pipeline.py` 还会故意阻塞深度任务，检查检测仍能完成、队列不增长、历史 XYZ 不会混入当前检测框。
-尚未新增 AMD GPU 后端、目标选择/锁定或 Teensy 控制接口。
+尚未新增 AMD GPU 后端或 Teensy 控制接口。目标选择、观测输出与请求预览检查见 `test_vision.py`。
 
 离线目录需包含 `original/*_left.png` 和对应的 `*_right.png`，每张图片为 `1280×720`。
 需要同时验证预览时追加 `--show-offline`。

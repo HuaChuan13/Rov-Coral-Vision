@@ -115,6 +115,9 @@ def check_async(left, right):
             assert all(r["objects"][0]["XYZ_rectified_left_m"] is None for r in records)
             assert all(r["objects"][0]["status"] == "depth_not_updated" for r in records)
             assert not summary["error"]
+            vision = [json.loads(line) for line in (folder / "vision_observations.jsonl").read_text().splitlines()]
+            assert [v["capture_seq"] for v in vision[:-1]] == list(range(6)), vision
+            assert all(not v["valid"] for v in vision) and vision[-1]["status"] == "stopped"
             StereoDepth.compute_frame = original_compute
             with contextlib.redirect_stdout(io.StringIO()):
                 assert (
@@ -171,7 +174,7 @@ def check_measurement_view():
     try:
         output.text = capture
         fresh = output.compose_view(color, [], geometry, args, 18, False, depth, 12, 80, 35)
-        assert fresh.shape == (880, 1280, 3)
+        assert fresh.shape == (928, 1280, 3)
         assert fresh.shape[1::-1] == output.view_size(geometry, args)
         assert np.array_equal(fresh[48:768, :1280], color), "Historical depth annotated current image"
         assert np.array_equal(depth["colors"], color), "Rendering modified the depth worker's image"
@@ -193,7 +196,7 @@ def check_measurement_view():
         assert any("No target" in line for line in labels)
         args = parse_args(["--show-depth"])
         debug = output.compose_view(color, [], geometry, args, 18, False, depth, 12, 80)
-        assert debug.shape == (880, 2688, 3)
+        assert debug.shape == (928, 2688, 3)
         assert debug.shape[1::-1] == output.view_size(geometry, args)
         assert any("DEPTH DEBUG | 12.0 FPS" in line for line in labels)
         assert np.array_equal(debug[48:768, :1280], color)

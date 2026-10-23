@@ -30,11 +30,25 @@ def main(size):
     user32.SetWindowPos.restype = W.BOOL
     user32.ShowWindow.argtypes = [W.HWND, C.c_int]
     user32.ShowWindow.restype = W.BOOL
+    user32.FindWindowExW.argtypes = [W.HWND, W.HWND, W.LPCWSTR, W.LPCWSTR]
+    user32.FindWindowExW.restype = W.HWND
+
+    def check_click():
+        child = user32.FindWindowExW(window.hwnd, None, 'HighGUI class', None)
+        assert child
+        x, y, width, height = window.fitted_rect
+        px, py = round(x + 750 * width / size[0]), round(y + 348 * height / size[1])
+        user32.SendMessageW(child, 0x0201, 1, px | (py << 16))
+        user32.SendMessageW(child, 0x0202, 0, px | (py << 16))
+        cv2.pollKey()
+        action, point = window.pop_click()
+        assert action == 'select' and np.allclose(point, (750, 348), atol=2), point
     image = np.full((size[1], size[0], 3), 90, np.uint8)
     cv2.circle(image, (672, 420), 180, (0, 255, 255), 8)
     try:
         window.show(image)
         cv2.waitKey(30)
+        check_click()
         for edge in range(1, 9):
             outer, client = W.RECT(), W.RECT()
             assert user32.GetWindowRect(window.hwnd, C.byref(outer))
@@ -49,9 +63,11 @@ def main(size):
             cv2.waitKey(5)
             _, _, w, h = cv2.getWindowImageRect(window.name)
             assert abs(w-h*size[0]/size[1]) <= 2, (edge, w, h)
+            check_click()
         user32.ShowWindow(window.hwnd, 3)  # Maximizing uses letterboxing instead of stretching.
         cv2.waitKey(10)
         window.show(image)
+        check_click()
         user32.ShowWindow(window.hwnd, 9)
         cv2.waitKey(10)
         assert user32.SendMessageW(window.hwnd, 0x0010, 0, 0) == 0  # Title-bar close.
@@ -61,9 +77,9 @@ def main(size):
         window.close()
         window.close()
     assert image.shape == (size[1], size[0], 3)
-    print('PASS: all 8 resize handles, minimum size, native events, maximize and close')
+    print('PASS: all 8 resize handles, minimum size, native mouse mapping, maximize and close')
 
 
 if __name__ == '__main__':
-    for size in ((1280, 880), (2688, 880)):
+    for size in ((1280, 928), (2688, 928)):
         main(size)

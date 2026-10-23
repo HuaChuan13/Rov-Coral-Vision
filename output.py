@@ -111,12 +111,12 @@ def detection_records(detections, size, confidence=0.6):
 
 def view_size(geometry, args):
     w, h = geometry.color_size
-    return (2 * w + 128 if args.show_depth else w, h + 160)
+    return (2 * w + 128 if args.show_depth else w, h + 208)
 
 
 def compose_view(
     color, detections, geometry, args, fps, recording, depth=None, depth_fps=0.0,
-    depth_age_ms=None, detection_age_ms=None,
+    depth_age_ms=None, detection_age_ms=None, observation=None, observation_output="UDP OFF",
 ):
     w, h = geometry.color_size
     if color.shape != (h, w, 3):
@@ -141,6 +141,27 @@ def compose_view(
     text(canvas, "REC" if recording else "REC OFF", (width - 120, 32),
          (30, 30, 255) if recording else (150, 150, 150), 0.7)
 
+    state = observation["status"].upper() if observation else "IDLE"
+    lock = observation["lock_id"] if observation else 0
+    valid = observation is not None and observation["valid"]
+    error = "%+.1f%% half-width" % (100 * observation["error_x"]) if valid else "--"
+    slew = "%+.2f deg/s" % observation["preview"]["yaw_target_slew_dps"] if valid else "-- (INVALID)"
+    fitted("TRACK %s | ID %d | error X %s | %s" % (state, lock, error, observation_output),
+           (16, h + 72), width - 32, accent, 0.65)
+    fitted("Yaw target slew: %s | PREVIEW ONLY - NOT SENT TO TEENSY" % slew,
+           (16, h + 98), width - 32, accent, 0.7)
+    if observation is not None:
+        reference = observation["reference_u"]
+        half_band = args.yaw_deadband * w / 2
+        for x in (reference - half_band, reference, reference + half_band):
+            if 0 <= x < w:
+                for y in range(48, 48 + h, 24):
+                    cv2.line(canvas, (round(x), y), (round(x), min(48 + h - 1, y + 10)), (180, 180, 180), 1)
+        if valid:
+            x1, y1, x2, y2 = np.rint(observation["target"]["box_rectified_xyxy"]).astype(int)
+            cv2.rectangle(canvas, (max(0, x1), 48 + max(0, y1)),
+                          (min(w - 1, x2), 48 + min(h - 1, y2)), accent, 3)
+
     if args.show_depth:
         # Display completion never supplies numeric XYZ measurements.
         canvas[48 : 48 + h, w : 2 * w] = depth["colors"] if depth is not None else 25
@@ -159,12 +180,12 @@ def compose_view(
             np.zeros((24, 28), np.uint8), cv2.COLORMAP_TURBO)
         text(canvas, "N/A", (legend_x + 36, h + 53), scale=0.65)
 
-    # ponytail: no cross-frame target identity yet; keep XYZ in a labelled snapshot list.
+    # Depth snapshots are independent of the current selected target.
     objects = depth["objects"] if depth is not None else []
-    state = "STALE" if stale else "WAIT" if depth is None else "frame %s | age %.0f ms" % (
+    state = "OFF" if not args.depth else "STALE" if stale else "WAIT" if depth is None else "frame %s | age %.0f ms" % (
         depth["seq"], depth_age_ms)
     fitted("DEPTH SNAPSHOT | %s | historical measurements, not current boxes" % state,
-           (16, h + 70), width - 32, (170, 170, 170), 0.6)
+           (16, h + 118), width - 32, (170, 170, 170), 0.6)
     for index, record in enumerate(objects[:2]):
         x1, y1, x2, y2 = np.rint(record["box_rectified_xyxy"]).astype(int)
         x1, x2 = np.clip([x1, x2], 0, w - 1)
@@ -179,14 +200,14 @@ def compose_view(
         values = "X: --    Y: --    Z: --  (no valid depth)"
         if xyz is not None and np.isfinite(xyz).all():
             values = "X: %+.1f    Y: %+.1f    Z: %.1f cm" % tuple(100 * v for v in xyz)
-        xy = (index * w + 16, h + 96) if args.show_depth else (16, h + 96 + index * 26)
+        xy = (index * w + 16, h + 144) if args.show_depth else (16, h + 144 + index * 26)
         fitted("%s  %s  |  %s" % (tag, record["class"], values), xy, w - 32, accent, 0.7)
     if not objects:
         message = (
-            "XYZ: -- | Depth expired" if stale else "XYZ: -- | Waiting for depth"
+            "XYZ: -- | Depth disabled" if not args.depth else "XYZ: -- | Depth expired" if stale else "XYZ: -- | Waiting for depth"
             if depth is None else "XYZ: -- | No target in depth frame"
         )
-        fitted(message, (16, h + 96), width - 32, accent, 0.7)
+        fitted(message, (16, h + 144), width - 32, accent, 0.7)
     calibration = (
         "Calibration OK"
         if geometry.verified and getattr(geometry, "quality_passed", None) is not False
@@ -195,8 +216,8 @@ def compose_view(
     note = "X right / Y down / Z forward"
     if len(objects) > 2:
         note += " | +%d targets in log" % (len(objects) - 2)
-    fitted("%s | %s | Q record / W, Esc exit" % (calibration, note),
-           (16, h + 148), width - 32, (170, 170, 170), 0.55)
+    fitted("%s | %s | Click select / C cancel / Q record / Esc exit" % (calibration, note),
+           (16, h + 196), width - 32, (170, 170, 170), 0.55)
     return canvas
 
 
