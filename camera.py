@@ -1,4 +1,4 @@
-"""One USB reader process and one atomic latest LEFT|RIGHT frame pair."""
+"""One USB/RTP reader process and one atomic latest LEFT|RIGHT frame pair."""
 
 import ctypes
 import multiprocessing as mp
@@ -56,12 +56,44 @@ class Packet:
     right: np.ndarray
     capture_fps: float
     max_gap_s: float
+    received_timestamp: float = 0.0
+    stream_pts: float = float("nan")
+
+
+def _network_worker(pixels, state, lock, stop, messages, options, shape):
+    from network_video import network_frames
+
+    buffer = np.frombuffer(pixels, np.uint8).reshape(shape)
+    rate = FrameRateTracker()
+    frames = network_frames(options, stop)
+    try:
+        for seq, (frame, stamp, received, pts) in enumerate(frames):
+            health = rate.add(received)
+            with lock:
+                buffer[0] = frame[:, :shape[2]]
+                buffer[1] = frame[:, shape[2]:]
+                state[:] = (seq, stamp, health["measured_arrival_fps"], health["max_gap_s"] or 0., received, pts)
+            if seq == 0:
+                messages.put(("ready", dict(
+                    source="rtp", host=options["stream_host"], port=options["stream_port"],
+                    layout="horizontal_sbs", swap=False, eye_size=[shape[2], shape[1]],
+                    actual_full_size=[frame.shape[1], frame.shape[0]], backend="FFmpeg RTP/H264",
+                    acquisition="one_process_atomic_latest_pair",
+                    timing="PTS mapped to earliest decoded arrival; detects delay growth, NOT exposure age",
+                )))
+            if stop.is_set():
+                break
+    finally:
+        frames.close()
 
 
 def _capture_worker(pixels, state, lock, stop, messages, options, shape):
     cap, timer = None, False
     try:
         timer = hasattr(ctypes, "WinDLL") and ctypes.WinDLL("winmm").timeBeginPeriod(1) == 0
+        if options["stream_host"]:
+            _network_worker(pixels, state, lock, stop, messages, options, shape)
+            return
         cv2.setNumThreads(1)
         backend = {"dshow": cv2.CAP_DSHOW, "msmf": cv2.CAP_MSMF, "any": cv2.CAP_ANY}[options["backend"]]
         cap = cv2.VideoCapture(options["device"], backend if os.name == "nt" else cv2.CAP_ANY)
@@ -94,7 +126,7 @@ def _capture_worker(pixels, state, lock, stop, messages, options, shape):
             with lock:
                 buffer[0] = frame[:, : shape[2]]
                 buffer[1] = frame[:, shape[2] :]
-                state[:] = (seq, stamp, health["measured_arrival_fps"], health["max_gap_s"] or 0.0)
+                state[:] = (seq, stamp, health["measured_arrival_fps"], health["max_gap_s"] or 0.0, stamp, float("nan"))
             if seq == 0:
                 code = int(cap.get(cv2.CAP_PROP_FOURCC))
                 messages.put(
@@ -131,23 +163,28 @@ def _capture_worker(pixels, state, lock, stop, messages, options, shape):
 
 
 class Camera:
-    def __init__(self, device=1, width=2560, height=720, fps=30, backend="dshow", exposure=None):
+    def __init__(self, device=1, width=2560, height=720, fps=30, backend="dshow", exposure=None,
+                 stream_host=None, stream_port=5600, ffmpeg="ffmpeg"):
         if device < 0 or width <= 0 or width % 2 or height <= 0 or fps <= 0:
             raise ValueError("Expected nonnegative camera index, positive SBS dimensions and FPS.")
         if backend not in ("dshow", "msmf", "any") or exposure is not None and not np.isfinite(exposure):
             raise ValueError("Invalid capture backend/exposure.")
+        if stream_host:
+            from network_video import validate_network
+            ffmpeg = validate_network(stream_host, stream_port, ffmpeg)
         self.shape = (2, height, width // 2, 3)
         context = mp.get_context("spawn")
         self.pixels = context.RawArray(ctypes.c_ubyte, int(np.prod(self.shape)))
-        self.state = context.RawArray(ctypes.c_double, [-1.0, 0.0, 0.0, 0.0])
+        self.state = context.RawArray(ctypes.c_double, [-1.0, 0.0, 0.0, 0.0, 0.0, float("nan")])
         self.lock, self.stop = context.Lock(), context.Event()
         self.messages = context.Queue(maxsize=4)
         self.cached, self.closed = None, False
-        options = dict(device=device, width=width, height=height, fps=fps, backend=backend, exposure=exposure)
+        options = dict(device=device, width=width, height=height, fps=fps, backend=backend, exposure=exposure,
+                       stream_host=stream_host, stream_port=stream_port, ffmpeg=ffmpeg)
         self.process = context.Process(
             target=_capture_worker,
             args=(self.pixels, self.state, self.lock, self.stop, self.messages, options, self.shape),
-            name="usb-camera",
+            name="network-camera" if stream_host else "usb-camera",
             daemon=True,
         )
         self.process.start()
@@ -160,8 +197,8 @@ class Camera:
             self.close()
             if isinstance(exc, queue.Empty):
                 raise TimeoutError(
-                    "Camera initialization timed out after 25 s (backend=%s); check the device/index or use --backend dshow."
-                    % backend
+                    "Camera initialization timed out after 25 s; check sender, UDP firewall/port and FFmpeg"
+                    if stream_host else "USB camera initialization timed out after 25 s; check device/backend"
                 ) from exc
             raise
 
@@ -173,13 +210,13 @@ class Camera:
         except queue.Empty:
             pass
         if not self.process.is_alive():
-            raise RuntimeError("USB camera reader exited unexpectedly.")
+            raise RuntimeError("Camera reader exited unexpectedly.")
         with self.lock:
-            seq, stamp, fps, gap = self.state[:]
+            seq, stamp, fps, gap, received, pts = self.state[:]
             if self.cached is None or self.cached.seq != int(seq):
                 pair = np.frombuffer(self.pixels, np.uint8).reshape(self.shape).copy()
-                self.cached = Packet(int(seq), stamp, pair[0], pair[1], fps, gap)
-        if time.monotonic() - self.cached.timestamp > 5:
+                self.cached = Packet(int(seq), stamp, pair[0], pair[1], fps, gap, received, pts)
+        if time.monotonic() - self.cached.received_timestamp > 5:
             raise RuntimeError("No fresh camera frame for 5 seconds.")
         return self.cached
 

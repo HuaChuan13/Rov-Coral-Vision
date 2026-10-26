@@ -1,4 +1,4 @@
-"""USB stereo coral detection and calibrated XYZ. Q records; W saves/exits."""
+"""USB/RTP stereo coral detection and calibrated XYZ. Q records; W saves/exits."""
 
 import argparse
 import ctypes
@@ -42,14 +42,18 @@ def parse_args(argv=None):
     mode.add_argument(
         "--capture-only",
         action="store_true",
-        help="Measure USB arrivals without YOLO, depth, GUI or video encoding",
+        help="Measure USB/network arrivals without YOLO, depth, GUI or video encoding",
     )
     mode.add_argument(
         "--offline", type=Path, help="Dataset folder, reads original/*_left.png; NEVER opens a camera"
     )
     p.add_argument("--calibration", type=Path, default=DEFAULT_CALIBRATION)
     p.add_argument("--model", type=Path, default=DEFAULT_MODEL)
-    p.add_argument("--camera", type=int, default=1, help="UVC device index; verify identity before live run")
+    source = p.add_mutually_exclusive_group()
+    source.add_argument("--camera", type=int, default=1, help="UVC device index; verify identity before live run")
+    source.add_argument("--stream-host", help="Receive RTP/H264 from this Jetson IPv4 address instead of USB")
+    p.add_argument("--stream-port", type=int, default=5600, help="Local RTP port (payload 96, RTCP uses port+1)")
+    p.add_argument("--ffmpeg", default="ffmpeg", help="Installed FFmpeg executable for network input")
     p.add_argument("--capture-fps", type=float, default=30.0)
     p.add_argument(
         "--exposure",
@@ -127,6 +131,14 @@ def parse_args(argv=None):
     if args.track_confidence is None:
         args.track_confidence = min(0.35, args.confidence)
     args.live = args.offline is None and not args.capture_only
+    if args.stream_host:
+        if args.offline or args.exposure is not None:
+            p.error("Network input cannot be combined with offline data or USB exposure settings")
+        from network_video import validate_network
+        try:
+            args.ffmpeg = validate_network(args.stream_host, args.stream_port, args.ffmpeg)
+        except ValueError as exc:
+            p.error(str(exc))
     numeric = (
         args.near,
         args.far,
@@ -179,6 +191,12 @@ def frame_rate(stamps):
     return (len(stamps) - 1) / (stamps[-1] - stamps[0]) if len(stamps) > 1 and stamps[-1] > stamps[0] else 0.0
 
 
+def open_camera(args, width=2560, height=720):
+    return Camera(args.camera, width=width, height=height, fps=args.capture_fps,
+                  backend=args.backend, exposure=args.exposure, stream_host=args.stream_host,
+                  stream_port=args.stream_port, ffmpeg=args.ffmpeg)
+
+
 def capture_benchmark(args):
     folder = args.output / ("capture_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
     folder.mkdir(parents=True)
@@ -186,11 +204,12 @@ def capture_benchmark(args):
     stamps, skipped, previous = [], 0, -1
     try:
         timer = hasattr(ctypes, "WinDLL") and ctypes.WinDLL("winmm").timeBeginPeriod(1) == 0
-        camera = Camera(args.camera, fps=args.capture_fps, backend=args.backend, exposure=args.exposure)
+        camera = open_camera(args)
         save_json(folder / "camera.json", camera.meta)
         with (folder / "capture_metrics.csv").open("w", newline="", encoding="utf-8-sig") as stream:
             writer = csv.writer(stream)
-            writer.writerow(["capture_seq", "capture_monotonic_s", "capture_fps", "max_gap_s"])
+            writer.writerow(["capture_seq", "capture_monotonic_s", "capture_fps", "max_gap_s",
+                             "received_monotonic_s", "stream_pts_s", "delay_growth_ms"])
             while len(stamps) < (args.frames or 150):
                 if args.stop_file and args.stop_file.exists():
                     break
@@ -201,8 +220,10 @@ def capture_benchmark(args):
                 if previous >= 0:
                     skipped += max(0, packet.seq - previous - 1)
                 previous = packet.seq
-                stamps.append(packet.timestamp)
-                writer.writerow([packet.seq, packet.timestamp, packet.capture_fps, packet.max_gap_s])
+                stamps.append(packet.received_timestamp)
+                writer.writerow([packet.seq, packet.timestamp, packet.capture_fps, packet.max_gap_s,
+                                 packet.received_timestamp, packet.stream_pts if args.stream_host else None,
+                                 1000 * (packet.received_timestamp - packet.timestamp)])
     except BaseException as exc:
         error = repr(exc)
         raise
@@ -374,13 +395,10 @@ def main(argv=None):
                 raise ValueError("No original/*_left.png offline pairs.")
         else:
             timer = hasattr(ctypes, "WinDLL") and ctypes.WinDLL("winmm").timeBeginPeriod(1) == 0
-            camera = Camera(
-                args.camera,
+            camera = open_camera(
+                args,
                 width=2 * geometry.size[0],
                 height=geometry.size[1],
-                fps=args.capture_fps,
-                backend=args.backend,
-                exposure=args.exposure,
             )
             save_json(run / "camera.json", camera.meta)
         if show:
@@ -413,6 +431,9 @@ def main(argv=None):
                     "depth_frame_id",
                     "depth_age_ms",
                     "depth_updated",
+                    "received_monotonic_s",
+                    "stream_pts_s",
+                    "delay_growth_ms",
                 ]
             )
             while not limit or frame_no < limit:
@@ -563,6 +584,9 @@ def main(argv=None):
                     depth["seq"] if depth else None,
                     depth_age_ms,
                     updated,
+                    packet.received_timestamp if camera else None,
+                    packet.stream_pts if args.stream_host else None,
+                    1000 * (packet.received_timestamp - stamp) if camera else None,
                 ]
                 writer.writerow(row)
                 detections_log.write(

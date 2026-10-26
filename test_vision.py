@@ -66,6 +66,7 @@ def check_pipeline(freeze=True, confidence=.6):
             image = np.zeros((720, 1280, 3), np.uint8)
             self.packet = SimpleNamespace(seq=self.seq, timestamp=time.monotonic(), left=image,
                                           right=image, capture_fps=18.)
+            self.packet.received_timestamp = self.packet.timestamp
             return self.packet
         def close(self):
             pass

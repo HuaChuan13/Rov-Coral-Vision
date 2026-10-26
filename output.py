@@ -157,6 +157,10 @@ def compose_view(
     }
     mode = control.get("mode") if control else None
     heading = "%s | %s | %.1f FPS" % (mode or "TEENSY --", labels[status], fps)
+    if getattr(args, "stream_host", None):
+        heading = "RTP | " + heading
+        if detection_age_ms is not None and detection_age_ms > args.vision_max_age * 1000:
+            heading = "RTP STALE - CONTROL INVALID | " + (mode or "TEENSY --")
     fitted(heading, (16, 32), w - (100 if recording else 32), scale=.7)
     if recording:
         text(canvas, "REC", (w - 72, 32), (30, 30, 255), .65)

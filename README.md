@@ -2,7 +2,7 @@
 
 普通 USB 左右拼接双目相机的实时珊瑚检测、图像增强和水下标定测距程序。使用 uv 管理 Python 和依赖。
 
-后续开发见 [珊瑚 yaw 视觉闭环计划](PLAN.md)：方案 A 为视觉偏差 → 目标航向变化速度 → Teensy 更新目标 yaw → 原有双环。本地相机、Controller 和 Teensy 已接通；工控机网络视频移到本地闭环验收之后适配。
+后续开发见 [珊瑚 yaw 视觉闭环计划](PLAN.md)：方案 A 为视觉偏差 → 目标航向变化速度 → Teensy 更新目标 yaw → 原有双环。支持本地 USB 或 Jetson RTP 网络双目输入；Controller 仍通过独立 USB 连接 Teensy。
 
 ## 安装与启动
 
@@ -49,6 +49,52 @@ uv run --locked python run.py --help
 默认自动选择可用的 NVIDIA CUDA，否则使用 CPU。当前版本没有 AMD DirectML 推理后端，
 不能通过 `--device 0` 启用 RX 7800 XT。CUDA 运行库随 PyTorch 安装，无需另装 CUDA Toolkit；
 Windows VC++ 运行库及 NVIDIA 驱动属于系统组件。
+
+## 工控机网络视频
+
+相机接 Jetson，网线连接 PC；Teensy 仍单独通过 USB 接 PC。只运行 Jetson 的 `video_udp.py`，本方案不需要控制 Gateway 主程序。视觉、Rov_gateway、Controller 的开发分支为 `codex/network-video`；固件继续使用已验证的 `codex/local-visual-yaw`，无需重新烧录。Controller 修正 Windows 粗时钟造成的发送降频，协议及 PID 不变。
+
+先在 Jetson 终端启动（PC 有线地址 `192.168.10.1`，Jetson `192.168.10.2`）：
+
+```bash
+cd /home/nvidia/Code/python/rov_gateway
+/home/linuxbrew/.linuxbrew/bin/uv run python video_udp.py --preset stereo-720 --input-format mjpeg --encoder nvv4l2h264enc --host 192.168.10.1 --port 5600
+```
+
+再在 PC 本项目目录运行：
+
+```powershell
+uv run --locked python run.py --stream-host 192.168.10.2 --device cpu --confidence 0.5
+
+# 单独检查网络收帧，不加载识别/深度或发送控制
+uv run --locked python run.py --capture-only --stream-host 192.168.10.2 --frames 150
+```
+
+需要 PATH 中的 `ffmpeg`（本机已验证 FFmpeg 8.0），也可用 `--ffmpeg C:\path\ffmpeg.exe` 指定。`uv sync` 不安装此系统程序。无需重编译 OpenCV 或安装 Python GStreamer 绑定。Windows 防火墙须允许来自 Jetson 的 FFmpeg UDP 接收；RTP 为5600，RTCP占用5601，端口可用 `--stream-port` 改，但发送端要同步修改。相同端口只能给一个接收程序使用；先关闭 GStreamer/FFplay 测试播放器。
+
+网络参数替代 `--camera`，不是把相机编号改成 URL。必须发送 `2560×720 LEFT|RIGHT`、H.264、RTP payload 96；尺寸不匹配直接报错，不自动拉伸。`--capture-fps`、`--backend` 是本地 USB 参数，网络帧率在 Jetson 发送端配置。识别416、深度320、异步不限频和现有标定保持不变；H.264 对测距精度的影响仍需已知距离对照。
+
+Controller 的启动方式不变，在它的目录运行：
+
+```powershell
+uv run python ds5_teensy_demo.py --teensy-port COM3 --vision --vofa
+```
+
+先确认自稳模式，再点击珊瑚；右键/C取消。网络接收仍只保留最新完整左右帧，未增加控制协议或另一套 PID。顶部 `RTP` 表示网络输入，画面过期显示 `RTP STALE - CONTROL INVALID`。
+
+时间戳规则：FFmpeg 解码后的每一帧与其 PTS 一一配对，按本次会话最早到达基线映射到 PC 单调时钟。`frame_metrics.csv` 新增 `received_monotonic_s`、`stream_pts_s`、`delay_growth_ms`；`capture_monotonic_s` 在网络模式下是这个映射时间，**不是曝光时间**。已积压的帧不会因为刚解码而重新取得完整有效期，但启动时已有的固定延迟不可由此测得。完整相机→Teensy延迟仍须端到端测量，不能把日志的帧龄当作该值。
+
+帧过期沿用200ms撤销机制；画面恢复后须重新点击。连续5秒没有新解码帧，或源PTS回退/突跳、尺寸改变、解码进程异常时退出并释放接收端；重新启动程序后再选目标。5秒是接收程序退出期限，**不是继续控制5秒**。首版不做后台自动重连。
+
+软件检查（不连接串口）：
+
+```powershell
+uv run --locked python test_network_video.py --integration
+```
+
+该检查覆盖真实本机 RTP/FFmpeg 解码、慢消费者跳帧、短暂断流后不自动恢复锁定、断流超时、端口释放及非法视频时间戳。
+
+2026-10-26 实测：按用户要求在约5分钟结束连续观察，处理4633帧，平均16.12 FPS；接收延迟增长P95约28.9ms，映射帧龄P95约66.7ms（均不是曝光到执行延迟）。后续重启推流的台架测试中实际接收约30 FPS、识别约26 FPS，不能据此保证所有曝光/场景都到30 FPS。最终真实Jetson→PC识别→Controller→COM3 Teensy无动力测试约50秒，收到1866份活动回执；三次脚本选定、取消、0.6秒推流暂停、恢复后重新选择及彻底停止推流全部验证，除主动故障外没有额外超时。Controller发送实测48.08Hz，八路PWM始终1500，结束确认MANUAL/LIMIT0。记录在本机 `coral_runs/network_bench/verified_result.json`；这是脚本调用选择入口的无动力检查，不替代物理手柄/鼠标、水下运动、已知距离或端到端时延验收。
 
 ## 窗口与录制
 
@@ -195,7 +241,7 @@ uv run --locked python test_vision.py
 
 ## 本地视觉 yaw 辅助
 
-使用三个项目 `codex/local-visual-yaw` 分支的配套版本，Teensy 需烧录该分支固件。两个终端分别启动：
+Teensy 使用 `codex/local-visual-yaw` 配套固件；当前视觉和Controller在 `codex/network-video` 上兼容本地USB输入。两个终端分别启动：
 
 ```powershell
 # Controller 目录：COM3 为本次实测端口，按实际枚举修改；--vofa 可选
@@ -331,7 +377,8 @@ uv run --locked python run.py --camera 0 --device cpu
 | 文件 | 职责 |
 |---|---|
 | `run.py` | 实时/离线统一入口、参数和处理主流程 |
-| `camera.py` | USB 采集进程、原子最新双目帧与实际帧率统计 |
+| `camera.py` | USB/网络采集进程、原子最新双目帧与实际到达帧率统计 |
+| `network_video.py` | FFmpeg RTP/H.264 接收、PTS 配对与延迟增长检查 |
 | `stereo.py` | JSON 标定、SGBM/WLS、同帧 XYZ、公共补洞与 CPU 深度显示 |
 | `gpu_depth.py` | NVIDIA CUDA 重建和内核 |
 | `image_enhancement.py` | 图像增强 |
