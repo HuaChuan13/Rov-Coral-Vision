@@ -77,7 +77,7 @@ def _network_worker(pixels, state, lock, stop, messages, options, shape):
                 messages.put(("ready", dict(
                     source="rtp", host=options["stream_host"], port=options["stream_port"],
                     layout="horizontal_sbs", swap=False, eye_size=[shape[2], shape[1]],
-                    actual_full_size=[frame.shape[1], frame.shape[0]], backend="FFmpeg RTP/H264",
+                    actual_full_size=[frame.shape[1], frame.shape[0]], backend=options["stream_backend"] + " RTP/H264",
                     acquisition="one_process_atomic_latest_pair",
                     timing="PTS mapped to earliest decoded arrival; detects delay growth, NOT exposure age",
                 )))
@@ -164,14 +164,20 @@ def _capture_worker(pixels, state, lock, stop, messages, options, shape):
 
 class Camera:
     def __init__(self, device=1, width=2560, height=720, fps=30, backend="dshow", exposure=None,
-                 stream_host=None, stream_port=5600, ffmpeg="ffmpeg"):
+                 stream_host=None, stream_port=5600, ffmpeg="ffmpeg",
+                 stream_backend="gstreamer", gstreamer="gst-launch-1.0"):
         if device < 0 or width <= 0 or width % 2 or height <= 0 or fps <= 0:
             raise ValueError("Expected nonnegative camera index, positive SBS dimensions and FPS.")
         if backend not in ("dshow", "msmf", "any") or exposure is not None and not np.isfinite(exposure):
             raise ValueError("Invalid capture backend/exposure.")
         if stream_host:
             from network_video import validate_network
-            ffmpeg = validate_network(stream_host, stream_port, ffmpeg)
+            executable = validate_network(stream_host, stream_port,
+                                          gstreamer if stream_backend == "gstreamer" else ffmpeg, stream_backend)
+            if stream_backend == "gstreamer":
+                gstreamer = executable
+            else:
+                ffmpeg = executable
         self.shape = (2, height, width // 2, 3)
         context = mp.get_context("spawn")
         self.pixels = context.RawArray(ctypes.c_ubyte, int(np.prod(self.shape)))
@@ -180,7 +186,8 @@ class Camera:
         self.messages = context.Queue(maxsize=4)
         self.cached, self.closed = None, False
         options = dict(device=device, width=width, height=height, fps=fps, backend=backend, exposure=exposure,
-                       stream_host=stream_host, stream_port=stream_port, ffmpeg=ffmpeg)
+                       stream_host=stream_host, stream_port=stream_port, ffmpeg=ffmpeg,
+                       stream_backend=stream_backend, gstreamer=gstreamer)
         self.process = context.Process(
             target=_capture_worker,
             args=(self.pixels, self.state, self.lock, self.stop, self.messages, options, self.shape),
@@ -197,7 +204,7 @@ class Camera:
             self.close()
             if isinstance(exc, queue.Empty):
                 raise TimeoutError(
-                    "Camera initialization timed out after 25 s; check sender, UDP firewall/port and FFmpeg"
+                    "Camera initialization timed out after 25 s; check sender, UDP firewall/port and decoder runtime"
                     if stream_host else "USB camera initialization timed out after 25 s; check device/backend"
                 ) from exc
             raise

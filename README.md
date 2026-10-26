@@ -52,7 +52,7 @@ Windows VC++ 运行库及 NVIDIA 驱动属于系统组件。
 
 ## 工控机网络视频
 
-相机接 Jetson，网线连接 PC；Teensy 仍单独通过 USB 接 PC。只运行 Jetson 的 `video_udp.py`，本方案不需要控制 Gateway 主程序。视觉、Rov_gateway、Controller 的开发分支为 `codex/network-video`；固件继续使用已验证的 `codex/local-visual-yaw`，无需重新烧录。Controller 修正 Windows 粗时钟造成的发送降频，协议及 PID 不变。
+相机接 Jetson，网线连接 PC；Teensy 仍单独通过 USB 接 PC。只运行 Jetson 的 `video_udp.py`，本方案不需要控制 Gateway 主程序。视觉、Rov_gateway 的当前修复分支为 `codex/video-capture-fix`；Controller沿用 `codex/network-video`，固件沿用 `codex/local-visual-yaw`，无需重新烧录。Controller已修正Windows粗时钟造成的发送降频，协议及PID不变。
 
 先在 Jetson 终端启动（PC 有线地址 `192.168.10.1`，Jetson `192.168.10.2`）：
 
@@ -70,7 +70,13 @@ uv run --locked python run.py --stream-host 192.168.10.2 --device cpu --confiden
 uv run --locked python run.py --capture-only --stream-host 192.168.10.2 --frames 150
 ```
 
-需要 PATH 中的 `ffmpeg`（本机已验证 FFmpeg 8.0），也可用 `--ffmpeg C:\path\ffmpeg.exe` 指定。`uv sync` 不安装此系统程序。无需重编译 OpenCV 或安装 Python GStreamer 绑定。Windows 防火墙须允许来自 Jetson 的 FFmpeg UDP 接收；RTP 为5600，RTCP占用5601，端口可用 `--stream-port` 改，但发送端要同步修改。相同端口只能给一个接收程序使用；先关闭 GStreamer/FFplay 测试播放器。
+默认使用 PC 上的 GStreamer runtime（本机已安装并验证1.28.3，含libav插件），无需重编译 OpenCV 或安装 Python GI 绑定。`uv sync` 不安装此系统程序；可用 `gst-launch-1.0 --version` 检查，或用 `--gstreamer C:\path\gst-launch-1.0.exe` 指定路径。程序自己接收UDP，只接受 `--stream-host` 指定的源IP，再通过保留包边界的管道交给解码器。Windows 防火墙须允许本项目 Python 接收来自 Jetson 的 UDP5600；改端口时用 `--stream-port` 并同步发送端。相同端口只能给一个接收程序使用；先关闭其他播放器。
+
+保留 `--stream-backend ffmpeg` 手动回退（本机FFmpeg8.0，路径可用 `--ffmpeg` 指定）。该路径会额外占用RTCP端口5601，实测比默认路径多等待约一帧，不建议作为低延迟控制的默认接收方式。启动示例：
+
+```powershell
+uv run --locked python run.py --stream-host 192.168.10.2 --device cpu --confidence 0.5 --stream-backend ffmpeg
+```
 
 网络参数替代 `--camera`，不是把相机编号改成 URL。必须发送 `2560×720 LEFT|RIGHT`、H.264、RTP payload 96；尺寸不匹配直接报错，不自动拉伸。`--capture-fps`、`--backend` 是本地 USB 参数，网络帧率在 Jetson 发送端配置。识别416、深度320、异步不限频和现有标定保持不变；H.264 对测距精度的影响仍需已知距离对照。
 
@@ -82,7 +88,7 @@ uv run python ds5_teensy_demo.py --teensy-port COM3 --vision --vofa
 
 先确认自稳模式，再点击珊瑚；右键/C取消。网络接收仍只保留最新完整左右帧，未增加控制协议或另一套 PID。顶部 `RTP` 表示网络输入，画面过期显示 `RTP STALE - CONTROL INVALID`。
 
-时间戳规则：FFmpeg 解码后的每一帧与其 PTS 一一配对，按本次会话最早到达基线映射到 PC 单调时钟。`frame_metrics.csv` 新增 `received_monotonic_s`、`stream_pts_s`、`delay_growth_ms`；`capture_monotonic_s` 在网络模式下是这个映射时间，**不是曝光时间**。已积压的帧不会因为刚解码而重新取得完整有效期，但启动时已有的固定延迟不可由此测得。完整相机→Teensy延迟仍须端到端测量，不能把日志的帧龄当作该值。
+时间戳规则：每个完整BGR缓冲与其PTS一一配对；默认接收端用RTP时钟，不再叠加GStreamer的动态时钟校正。首秒只建立映射基准，不发布可选择帧，避免启动突发造成错误的时钟跳变判断。随后按本次会话最早到达基线映射到PC单调时钟。`frame_metrics.csv` 包含 `received_monotonic_s`、`stream_pts_s`、`delay_growth_ms`；`capture_monotonic_s` 在网络模式下是这个映射时间，**不是曝光时间**。积压帧不能重新取得完整有效期，启动时已有的固定延迟仍不可由此测得。完整相机→Teensy延迟须端到端测量。
 
 帧过期沿用200ms撤销机制；画面恢复后须重新点击。连续5秒没有新解码帧，或源PTS回退/突跳、尺寸改变、解码进程异常时退出并释放接收端；重新启动程序后再选目标。5秒是接收程序退出期限，**不是继续控制5秒**。首版不做后台自动重连。
 
@@ -92,7 +98,11 @@ uv run python ds5_teensy_demo.py --teensy-port COM3 --vision --vofa
 uv run --locked python test_network_video.py --integration
 ```
 
-该检查覆盖真实本机 RTP/FFmpeg 解码、慢消费者跳帧、短暂断流后不自动恢复锁定、断流超时、端口释放及非法视频时间戳。
+该检查覆盖GStreamer/FFmpeg两条本机真实RTP解码路径、慢消费者跳帧、短暂断流后不自动恢复锁定、断流超时、端口释放、非法包/尺寸/时间戳和损坏缓冲。
+
+分段排查结论（2026-10-26）：当前物理相机采集约16.15FPS，JPEG解码、H.264输出及PC接收均基本同速；未发现网络继续降低帧率。相机只采集和曝光对照也未恢复30FPS，曝光设置已恢复，不能将30FPS请求值视为保证值。默认接收路径测得完整RTP帧到可用BGR约7ms，旧FFmpeg路径约70ms；此处仅测接收侧，不是曝光到执行延迟。完整识别/异步深度350帧测试约16.15FPS，映射帧龄P95约73ms，无运行错误。详细分段计数可在Jetson运行 `video_probe.py`，见Rov_gateway视频文档。
+
+用户拔插相机后再次实测：单采16.147FPS，完整编码16.149FPS；PC完整负载220帧无错误，映射帧龄P95约57.6ms，30FPS仍未恢复。当前定位到相机/UVC采集端，不能据此断言具体固件或硬件故障。另用本机10FPS合成RTP、固定测试目标、真实YOLO/异步深度负载、生产VisionBridge与编译固件模块做时序检查：160帧、743份活动回执、零过期。该检查模拟IMU和串口，不是实机或真实目标跟踪验收；正常图像过期、手动接管和重新点击规则仍保留。记录在本机 `coral_runs/video_diagnostics/`。
 
 2026-10-26 实测：按用户要求在约5分钟结束连续观察，处理4633帧，平均16.12 FPS；接收延迟增长P95约28.9ms，映射帧龄P95约66.7ms（均不是曝光到执行延迟）。后续重启推流的台架测试中实际接收约30 FPS、识别约26 FPS，不能据此保证所有曝光/场景都到30 FPS。最终真实Jetson→PC识别→Controller→COM3 Teensy无动力测试约50秒，收到1866份活动回执；三次脚本选定、取消、0.6秒推流暂停、恢复后重新选择及彻底停止推流全部验证，除主动故障外没有额外超时。Controller发送实测48.08Hz，八路PWM始终1500，结束确认MANUAL/LIMIT0。记录在本机 `coral_runs/network_bench/verified_result.json`；这是脚本调用选择入口的无动力检查，不替代物理手柄/鼠标、水下运动、已知距离或端到端时延验收。
 
@@ -378,7 +388,7 @@ uv run --locked python run.py --camera 0 --device cpu
 |---|---|
 | `run.py` | 实时/离线统一入口、参数和处理主流程 |
 | `camera.py` | USB/网络采集进程、原子最新双目帧与实际到达帧率统计 |
-| `network_video.py` | FFmpeg RTP/H.264 接收、PTS 配对与延迟增长检查 |
+| `network_video.py` | GStreamer低延迟RTP接收、FFmpeg回退、PTS配对与延迟增长检查 |
 | `stereo.py` | JSON 标定、SGBM/WLS、同帧 XYZ、公共补洞与 CPU 深度显示 |
 | `gpu_depth.py` | NVIDIA CUDA 重建和内核 |
 | `image_enhancement.py` | 图像增强 |

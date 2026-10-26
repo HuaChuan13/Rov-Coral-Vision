@@ -9,13 +9,16 @@ import time
 import psutil
 
 from camera import Camera
-from network_video import StreamClock, read_frame, sdp_text
+from network_video import StreamClock, read_frame, sdp_text, gst_metadata, write_packet
 from run import parse_args
 from test_vision import record
 from vision import TargetObservation
 
 
 def check_clock_and_lock():
+    startup = StreamClock()
+    startup.stamp(0., 10.)
+    assert startup.stamp(.316, 10.004) <= 10.004  # Legitimate cold-start burst.
     clock = StreamClock()
     assert clock.stamp(0., 10.) == 10.
     assert abs(clock.stamp(.1, 10.12) - 10.1) < 1e-9
@@ -51,6 +54,22 @@ def check_short_reads():
             return super().readinto(view[:2])
     assert read_frame(Pipe(b"abcdef"), 6) == b"abcdef"
     assert read_frame(Pipe(b"abcde"), 6) is None
+    class Writer(io.BytesIO):
+        def write(self, value):
+            return super().write(value[:3])
+    writer = Writer()
+    write_packet(writer, b"RTP DATA")
+    assert writer.getvalue() == b"\x00\x08RTP DATA"
+    line = '<stamps> chain (6144 bytes, dts: none, pts: 0:01:02.125000000, duration: none, flags: 00000040 discont)'
+    assert gst_metadata(line, 6144) == 62.125
+    for invalid in (line.replace('6144', '6143'), line.replace('00000040', '00000100'),
+                    line.replace('0:01:02.125000000', 'none')):
+        try:
+            gst_metadata(invalid, 6144)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('Accepted wrong size, corrupted frame or missing PTS')
     assert "H264/90000" in sdp_text("192.168.10.2", 5600)
     try:
         sdp_text("192.168.10.2\nm=bad", 5600)
@@ -75,7 +94,7 @@ def free_port():
     raise RuntimeError("No free test RTP/RTCP ports")
 
 
-def check_integration():
+def check_integration(backend):
     port = free_port()
     sender = subprocess.Popen([
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-re",
@@ -88,14 +107,19 @@ def check_integration():
     camera = None
     try:
         try:
-            Camera(width=128, height=32, stream_host="127.0.0.1", stream_port=port)
+            Camera(width=128, height=32, stream_host="127.0.0.1", stream_port=port, stream_backend=backend)
         except RuntimeError as exc:
-            assert "Expected 128x32 SBS" in str(exc), str(exc)
+            assert "Expected 128x32 SBS" in str(exc) or "not-negotiated" in str(exc), str(exc)
         else:
             raise AssertionError("Wrong stereo dimensions were silently accepted")
-        camera = Camera(width=64, height=32, stream_host="127.0.0.1", stream_port=port)
+        camera = Camera(width=64, height=32, stream_host="127.0.0.1", stream_port=port, stream_backend=backend)
         first = camera.latest()
         assert first.left.shape == first.right.shape == (32, 32, 3)
+        if backend == "gstreamer":
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as noise:
+                for bad in (b'bad', b'\x00\x60' + bytes(22), b'\x80\x61' + bytes(22),
+                            b'\x8f\x60' + bytes(22)):
+                    noise.sendto(bad, ('127.0.0.1', port))
         # The slow consumer must skip, not queue or back-pressure the decoder.
         time.sleep(.5)
         latest = camera.latest()
@@ -148,5 +172,6 @@ if __name__ == "__main__":
     check_clock_and_lock()
     check_short_reads()
     if args.integration:
-        check_integration()
-    print("Network video checks passed" + (" (real loopback RTP/FFmpeg, timeout, cleanup)" if args.integration else ""))
+        for backend in ("gstreamer", "ffmpeg"):
+            check_integration(backend)
+    print("Network video checks passed" + (" (GStreamer/FFmpeg RTP, timeout, cleanup)" if args.integration else ""))

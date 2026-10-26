@@ -54,6 +54,9 @@ def parse_args(argv=None):
     source.add_argument("--stream-host", help="Receive RTP/H264 from this Jetson IPv4 address instead of USB")
     p.add_argument("--stream-port", type=int, default=5600, help="Local RTP port (payload 96, RTCP uses port+1)")
     p.add_argument("--ffmpeg", default="ffmpeg", help="Installed FFmpeg executable for network input")
+    p.add_argument("--stream-backend", choices=("gstreamer", "ffmpeg"), default="gstreamer",
+                   help="GStreamer reduces RTP receive latency; FFmpeg is a manual fallback")
+    p.add_argument("--gstreamer", default="gst-launch-1.0", help="GStreamer runtime executable")
     p.add_argument("--capture-fps", type=float, default=30.0)
     p.add_argument(
         "--exposure",
@@ -136,7 +139,8 @@ def parse_args(argv=None):
             p.error("Network input cannot be combined with offline data or USB exposure settings")
         from network_video import validate_network
         try:
-            args.ffmpeg = validate_network(args.stream_host, args.stream_port, args.ffmpeg)
+            key = "gstreamer" if args.stream_backend == "gstreamer" else "ffmpeg"
+            setattr(args, key, validate_network(args.stream_host, args.stream_port, getattr(args, key), args.stream_backend))
         except ValueError as exc:
             p.error(str(exc))
     numeric = (
@@ -194,7 +198,8 @@ def frame_rate(stamps):
 def open_camera(args, width=2560, height=720):
     return Camera(args.camera, width=width, height=height, fps=args.capture_fps,
                   backend=args.backend, exposure=args.exposure, stream_host=args.stream_host,
-                  stream_port=args.stream_port, ffmpeg=args.ffmpeg)
+                  stream_port=args.stream_port, ffmpeg=args.ffmpeg,
+                  stream_backend=args.stream_backend, gstreamer=args.gstreamer)
 
 
 def capture_benchmark(args):
